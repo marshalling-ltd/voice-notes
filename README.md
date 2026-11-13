@@ -31,20 +31,67 @@ On macOS the first run asks for microphone access for your terminal app. If it w
 ```sh
 cargo run                           # notes mode, full-screen interface
 cargo run -- --clean                # also polish the final transcript
-cargo run -- --talk                 # talk mode with the fast local model
-cargo run -- --talk --chat-model qwen-reasoner      # a reasoning model (slower)
-cargo run -- --talk --backend claude                # answers from Claude (see below)
+cargo run -- --talk                 # talk mode with the default (`fast`) profile
+cargo run -- --talk --profile dev   # technical answers
+cargo run -- --talk --profile think # a reasoning model that shows its thinking
+cargo run -- setup                  # find your models and services and save the best choices
 cargo run -- --plain                # line-by-line interface (also used when not in a terminal)
 ```
 
-Keys: `Enter` start/stop (or skip speech), `t` notes/talk, `r` read aloud, `c` clean (notes), `n` new conversation (talk), `↑↓` scroll, `q` quit.
+Keys: `Enter` start/stop (or skip speech), `p` next profile, `t` notes/talk, `r` read aloud, `u` setup, `c` clean (notes), `n` new conversation (talk), `↑↓` scroll, `q` quit.
 
-Other options: `--language hr` (spoken language, default `en`, `auto` to detect), `--threshold` (minimum speech level), `--no-speech` (text only), `--think` (let reasoning models think; much slower), `--verbose` (with `--plain`, show the live input level).
+Other options: `--language hr` (spoken language, default `en`, `auto` to detect), `--threshold` (minimum speech level), `--no-speech` (text only), `--verbose` (with `--plain`, show the live input level). `--backend`, `--chat-model` and `--think` adjust the launch profile.
 
-### Chat backends
+### Profiles
 
-- `--backend local` (default): a model on the local server, chosen with `--chat-model` (default `qwen3-coder-30b`). Reasoning models answer far faster with thinking off, which is the default; `--think` turns it on.
-- `--backend claude`: runs the `claude` CLI headless, restricted to read-only tools (`Read`, `Grep`, `Glob`), with the conversation kept across turns. What you say is sent to Anthropic and billed to your account.
+A profile is a named combination of backend, model, thinking and prompt. Switch live with `p` (the conversation starts afresh), or start with `--profile NAME`.
+
+| profile | model | thinking | for |
+| --- | --- | --- | --- |
+| `fast` (default) | your fast chat model (default `qwen3-coder-30b`) | off | quick everyday chat |
+| `dev` | the same model | off | technical answers, with a developer-oriented spoken prompt |
+| `smart` | a reasoning model | off | nicer answers, a few seconds slower |
+| `think` | a reasoning model | on | hard problems: the thinking is shown on screen, only the answer is spoken |
+| `claude` | the `claude` CLI | n/a | deep help; read-only tools (`Read`, `Grep`, `Glob`) |
+
+`smart` and `think` appear once `voice-notes setup` has found a reasoning model; `claude` appears when the CLI is installed (what you say is then sent to Anthropic and billed to your account). Reasoning models start answering much faster with thinking off, which is why only `think` turns it on.
+
+Define your own, or adjust a built-in one, in the config file:
+
+```toml
+profile = "dev"                    # the profile used at launch
+
+[profiles.dev]
+model = "my-coder"                 # keeps the dev prompt unless you set `prompt`
+
+[profiles.terse]
+model = "qwen3-coder-30b"
+think = false
+prompt = "Answer in at most five words."
+description = "Very short answers"
+```
+
+### Setup
+
+`voice-notes setup` looks at your machine and what you already run, picks the best option for each job, and saves the choices after asking (`--yes` skips the question, `--check` only reports, `--quick` skips timing the models). In the full-screen interface the same screen opens on first launch, and again with `u`; `s` skips it while it is still working.
+
+It reports:
+
+- **What it found:** the Whisper and chat models on the server, a Kokoro endpoint, the system voice, a player, the `claude` CLI, and which profiles that makes possible.
+- **Your machine:** OS, cores, RAM, GPU and free disk. Memory available to models is a card's VRAM (NVIDIA, or discrete AMD), the shared pool for Apple Silicon and AMD APUs (read from the kernel's `amdgpu` files on Linux), or half the RAM when there is no GPU.
+- **Speed:** it times a short clip through Whisper, a two-sentence reply from the chat model (cold, then warm, so you can see when a model had to load first), from the reasoning model, and one sentence from Kokoro, and rates each for conversation. Time to the first sentence is what matters: up to 1.5 s feels instant, up to 4 s is fine, beyond that is too slow for talking.
+- **What would help:** missing pieces, and a chat model that is too slow here, come with a suggestion sized for your machine:
+
+| memory for models | speech-to-text | chat | extras |
+| --- | --- | --- | --- |
+| under 8 GB (minimal) | Whisper small | Qwen3-4B | |
+| 8 to 16 GB (light) | large-v3-turbo | Qwen3-8B | |
+| 16 to 24 GB (standard) | large-v3-turbo | Qwen3-14B | |
+| 24 GB or more (power) | large-v3-turbo | Qwen3-Coder-30B-A3B | a reasoning model for `smart` and `think` |
+
+Sizes that were measured from real files are exact; estimates are marked with `~`. If the installed chat model is slower than your machine warrants, the suggestion is the model that fits (or the next size down if you are already there). This is a preview: nothing is downloaded yet.
+
+Saved settings live in `~/.config/voice-notes/config.toml` (Linux) or `~/Library/Application Support/voice-notes/config.toml` (macOS). Precedence is: command-line flag, then saved settings, then built-in defaults.
 
 ### Voice
 
@@ -68,7 +115,12 @@ If nothing appears while you speak, run `cargo run -- --plain --verbose` and com
 | --- | --- |
 | `src/audio.rs` | Microphone capture, noise calibration, silence-based segmentation, WAV encoding |
 | `src/transcribe.rs` | Whisper and chat HTTP calls, hallucination filter |
-| `src/chat.rs` | Conversation with a local model (streaming) or Claude, reasoning removal |
+| `src/chat.rs` | Conversation with a local model (streaming) or Claude, reasoning handling |
+| `src/profile.rs` | Profiles: fast, dev, smart, think, claude and your own |
+| `src/config.rs` | Saved settings |
+| `src/setup.rs` | Finds models and services, picks the best, suggests models for your machine, saves the choices |
+| `src/hardware.rs` | Detects memory, GPU and disk; size classes |
+| `src/latency.rs` | Times Whisper, the chat models and Kokoro |
 | `src/speech.rs` | Sentence splitting, Kokoro and system speech, playback queue |
 | `src/pipeline.rs` | Settings and the ordered transcription worker |
 | `src/ui.rs` | Full-screen interface (ratatui) |

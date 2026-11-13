@@ -15,6 +15,21 @@ use tokio::sync::mpsc::UnboundedSender;
 pub const SPOKEN_STYLE: &str = "You are a voice assistant. Your answers are read aloud, so reply \
 in one to three short, plain sentences. Never use markdown, lists, code blocks, emoji or URLs.";
 
+/// Style for the `dev` profile: technical help that still sounds right when spoken.
+pub const DEV_STYLE: &str = "You are a voice assistant for a software developer. Answers are read \
+aloud, so reply in a few short, plain sentences. Be technically precise. Never read code or \
+commands character by character: describe what they do instead. Never use markdown, lists, \
+code blocks, emoji or URLs.";
+
+/// A piece of an answer as it streams in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyDelta {
+    /// The model's reasoning: shown on screen, never spoken.
+    Thinking(String),
+    /// The answer itself.
+    Text(String),
+}
+
 /// How many past messages are sent to a local model.
 const MAX_HISTORY: usize = 20;
 /// Reasoning models can think for a long time.
@@ -114,26 +129,39 @@ fn parse_sse_line(line: &str) -> Sse {
         .map_or(Sse::Skip, Sse::Delta)
 }
 
-/// The part of `raw` a listener should hear so far: reasoning removed, and a possible start
-/// of a `<think>` tag held back until it is clear what it is.
-fn visible_text(raw: &str) -> String {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
-    let text = if let Some(end) = raw.rfind(CLOSE) {
-        &raw[end + CLOSE.len()..]
-    } else if let Some(start) = raw.find(OPEN) {
-        &raw[..start]
-    } else {
-        raw
-    };
-    let mut text = text.trim_start().to_string();
-    for keep in (1..OPEN.len()).rev() {
-        if text.ends_with(&OPEN[..keep]) {
+/// Drop a trailing piece of `tag` (a tag still being written) until it is clear what it is.
+fn hold_back(text: &str, tag: &str) -> String {
+    let mut text = text.to_string();
+    for keep in (1..tag.len()).rev() {
+        if text.ends_with(&tag[..keep]) {
             text.truncate(text.len() - keep);
             break;
         }
     }
     text
+}
+
+/// Split the raw stream so far into `(thinking, answer)`. A half-written tag is held back.
+fn split_think(raw: &str) -> (String, String) {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    if let Some(end) = raw.rfind(CLOSE) {
+        let before = &raw[..end];
+        let thinking = before.trim_start();
+        let thinking = thinking.strip_prefix(OPEN).unwrap_or(thinking).trim();
+        (
+            thinking.to_string(),
+            raw[end + CLOSE.len()..].trim_start().to_string(),
+        )
+    } else if let Some(start) = raw.find(OPEN) {
+        let thinking = raw[start + OPEN.len()..].trim_start();
+        (
+            hold_back(thinking, CLOSE),
+            raw[..start].trim_start().to_string(),
+        )
+    } else {
+        (String::new(), hold_back(raw.trim_start(), OPEN))
+    }
 }
 
 /// Remove a reasoning model's `<think>…</think>` block, leaving only the answer.
@@ -161,7 +189,7 @@ pub fn strip_reasoning(text: &str) -> String {
 
 /// Arguments for one headless `claude` call; the prompt itself goes on stdin.
 #[must_use]
-pub fn claude_args(session: &str, resume: bool) -> Vec<String> {
+pub fn claude_args(session: &str, resume: bool, prompt: &str) -> Vec<String> {
     let mut args = vec!["-p".to_string(), "--output-format".into(), "text".into()];
     if resume {
         args.extend(["--resume".to_string(), session.to_string()]);
@@ -170,7 +198,7 @@ pub fn claude_args(session: &str, resume: bool) -> Vec<String> {
     }
     args.extend([
         "--append-system-prompt".to_string(),
-        SPOKEN_STYLE.to_string(),
+        prompt.to_string(),
         // Attached form: the option takes a list and would otherwise swallow later arguments.
         "--allowedTools=Read,Grep,Glob".to_string(),
     ]);
@@ -211,7 +239,7 @@ async fn stream_local(
     model: &str,
     think: bool,
     messages: &[ChatMessage],
-    deltas: Option<&UnboundedSender<String>>,
+    deltas: Option<&UnboundedSender<ReplyDelta>>,
 ) -> Result<String> {
     let mut response = client
         .post("http://127.0.0.1:8080/v1/chat/completions")
@@ -229,7 +257,8 @@ async fn stream_local(
         .error_for_status()?;
 
     let mut raw = String::new();
-    let mut sent = 0;
+    let mut sent_answer = 0;
+    let mut sent_thinking = 0;
     let mut pending: Vec<u8> = Vec::new();
     'stream: while let Some(chunk) = response.chunk().await? {
         pending.extend_from_slice(&chunk);
@@ -239,12 +268,18 @@ async fn stream_local(
             match parse_sse_line(&String::from_utf8_lossy(&line)) {
                 Sse::Delta(piece) => {
                     raw.push_str(&piece);
-                    let visible = visible_text(&raw);
-                    if let Some(new) = visible.get(sent..).filter(|n| !n.is_empty()) {
+                    let (thinking, answer) = split_think(&raw);
+                    if let Some(new) = thinking.get(sent_thinking..).filter(|n| !n.is_empty()) {
                         if let Some(tx) = deltas {
-                            let _ = tx.send(new.to_string());
+                            let _ = tx.send(ReplyDelta::Thinking(new.to_string()));
                         }
-                        sent = visible.len();
+                        sent_thinking = thinking.len();
+                    }
+                    if let Some(new) = answer.get(sent_answer..).filter(|n| !n.is_empty()) {
+                        if let Some(tx) = deltas {
+                            let _ = tx.send(ReplyDelta::Text(new.to_string()));
+                        }
+                        sent_answer = answer.len();
                     }
                 }
                 Sse::Done => break 'stream,
@@ -258,6 +293,7 @@ async fn stream_local(
 /// A multi-turn conversation that remembers what was said.
 pub struct Conversation {
     backend: Backend,
+    prompt: String,
     history: Vec<ChatMessage>,
     session: String,
     started: bool,
@@ -268,10 +304,20 @@ impl Conversation {
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
+            prompt: SPOKEN_STYLE.to_string(),
             history: Vec::new(),
             session: new_session_id(),
             started: false,
         }
+    }
+
+    /// Use `prompt` as the system prompt instead of the default spoken style.
+    #[must_use]
+    pub fn with_prompt(mut self, prompt: Option<String>) -> Self {
+        if let Some(prompt) = prompt {
+            self.prompt = prompt;
+        }
+        self
     }
 
     /// Forget everything and start a fresh conversation.
@@ -284,7 +330,8 @@ impl Conversation {
     /// Send `user_text` and return the reply, ready to be shown and spoken.
     ///
     /// If `deltas` is given, the answer is also sent through it piece by piece as the model
-    /// writes it (reasoning removed), so it can be shown and spoken before it is complete.
+    /// writes it, so it can be shown and spoken before it is complete. Reasoning arrives as
+    /// [`ReplyDelta::Thinking`] and is never part of the returned answer.
     ///
     /// # Errors
     ///
@@ -294,7 +341,7 @@ impl Conversation {
         &mut self,
         client: &reqwest::Client,
         user_text: &str,
-        deltas: Option<&UnboundedSender<String>>,
+        deltas: Option<&UnboundedSender<ReplyDelta>>,
     ) -> Result<String> {
         let reply = match self.backend.clone() {
             Backend::Local { model, think } => {
@@ -304,7 +351,7 @@ impl Conversation {
             Backend::Claude => {
                 let reply = self.reply_claude(user_text).await?;
                 if let Some(tx) = deltas {
-                    let _ = tx.send(reply.clone());
+                    let _ = tx.send(ReplyDelta::Text(reply.clone()));
                 }
                 reply
             }
@@ -321,11 +368,11 @@ impl Conversation {
         model: &str,
         think: bool,
         user_text: &str,
-        deltas: Option<&UnboundedSender<String>>,
+        deltas: Option<&UnboundedSender<ReplyDelta>>,
     ) -> Result<String> {
         self.history.push(ChatMessage::new("user", user_text));
         let start = self.history.len().saturating_sub(MAX_HISTORY);
-        let mut messages = vec![ChatMessage::new("system", SPOKEN_STYLE)];
+        let mut messages = vec![ChatMessage::new("system", &self.prompt)];
         messages.extend_from_slice(&self.history[start..]);
 
         match stream_local(client, model, think, &messages, deltas).await {
@@ -341,7 +388,7 @@ impl Conversation {
     }
 
     async fn reply_claude(&mut self, user_text: &str) -> Result<String> {
-        let args = claude_args(&self.session, self.started);
+        let args = claude_args(&self.session, self.started, &self.prompt);
         let mut child = Command::new("claude")
             .args(&args)
             .stdin(Stdio::piped())
@@ -369,6 +416,11 @@ impl Conversation {
 mod tests {
     use super::*;
 
+    /// The part of `raw` a listener should hear so far: reasoning removed.
+    fn visible_text(raw: &str) -> String {
+        split_think(raw).1
+    }
+
     /// Reasoning blocks are removed whether or not they are well formed.
     #[test]
     fn strips_reasoning_variants() {
@@ -386,10 +438,10 @@ mod tests {
     /// an argument.
     #[test]
     fn claude_args_start_then_resume() {
-        let first = claude_args("abc", false);
+        let first = claude_args("abc", false, SPOKEN_STYLE);
         assert!(first.windows(2).any(|w| w == ["--session-id", "abc"]));
         assert!(!first.contains(&"--resume".to_string()));
-        let later = claude_args("abc", true);
+        let later = claude_args("abc", true, DEV_STYLE);
         assert!(later.windows(2).any(|w| w == ["--resume", "abc"]));
         assert!(later.contains(&"--allowedTools=Read,Grep,Glob".to_string()));
         assert_eq!(later[0], "-p");
@@ -495,5 +547,74 @@ mod tests {
                 .unwrap()
                 .contains("chat_template_kwargs")
         );
+    }
+
+    /// The stream is split into thinking and answer, holding back half-written tags.
+    #[test]
+    fn splits_thinking_from_answer() {
+        let split = |raw: &str| split_think(raw);
+        assert_eq!(split(""), (String::new(), String::new()));
+        assert_eq!(
+            split("plain answer"),
+            (String::new(), "plain answer".into())
+        );
+        assert_eq!(
+            split("<think>\nLet me see"),
+            ("Let me see".into(), String::new())
+        );
+        assert_eq!(
+            split("<think>\nLet me see</"),
+            ("Let me see".into(), String::new())
+        );
+        assert_eq!(
+            split("<think>\nLet me see\n</think>\n\nFour."),
+            ("Let me see".into(), "Four.".into())
+        );
+        assert_eq!(
+            split("<think>\n\n</think>\n\nHi"),
+            (String::new(), "Hi".into())
+        );
+        assert_eq!(
+            split("Answer.<think>later"),
+            ("later".into(), "Answer.".into())
+        );
+        assert_eq!(split("Tag <thin"), (String::new(), "Tag ".into()));
+    }
+
+    /// Thinking text only grows while it is being written, so it can be sliced by length.
+    #[test]
+    fn thinking_grows_while_streaming() {
+        let full = "<think>\nFirst, add them.\n</think>\n\nFour.";
+        let mut last = 0;
+        for end in (0..full.find("</think>").unwrap()).filter(|i| full.is_char_boundary(*i)) {
+            let (thinking, answer) = split_think(&full[..end]);
+            assert!(thinking.len() >= last, "shrank at {end}");
+            assert_eq!(answer, "");
+            last = thinking.len();
+        }
+    }
+
+    /// The dev profile's prompt differs from the default one, and a custom prompt replaces it.
+    #[test]
+    fn prompts() {
+        assert_ne!(DEV_STYLE, SPOKEN_STYLE);
+        assert!(DEV_STYLE.contains("software developer"));
+        let default = Conversation::new(Backend::Claude);
+        assert_eq!(default.prompt, SPOKEN_STYLE);
+        let dev = Conversation::new(Backend::Claude).with_prompt(Some(DEV_STYLE.to_string()));
+        assert_eq!(dev.prompt, DEV_STYLE);
+        let unchanged = Conversation::new(Backend::Claude).with_prompt(None);
+        assert_eq!(unchanged.prompt, SPOKEN_STYLE);
+    }
+
+    /// Claude is given the profile's prompt, not always the default.
+    #[test]
+    fn claude_gets_the_profile_prompt() {
+        let args = claude_args("abc", false, DEV_STYLE);
+        let at = args
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .unwrap();
+        assert_eq!(args[at + 1], DEV_STYLE);
     }
 }

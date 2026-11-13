@@ -16,8 +16,10 @@
 //! ```
 
 use crate::audio::AudioRecorder;
-use crate::chat::Conversation;
+use crate::chat::{Conversation, ReplyDelta};
+use crate::config::Config;
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
+use crate::setup::{self, Findings};
 use crate::speech::{SentenceSplitter, Speaker};
 use crate::transcribe::{TranscribeOptions, clean_transcript};
 use anyhow::Result;
@@ -89,6 +91,8 @@ pub enum Reply {
 pub struct Turn {
     pub user: String,
     pub reply: Reply,
+    /// The model's reasoning so far, shown while it works (the `think` profile).
+    pub thinking: String,
 }
 
 /// What a transcribed utterance looks like on screen.
@@ -109,7 +113,7 @@ pub struct Entry {
 }
 
 /// A request from the keyboard that needs the recorder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Start,
     Stop,
@@ -119,6 +123,32 @@ pub enum Action {
     ReadAloud,
     /// Forget the conversation so far.
     NewConversation,
+    /// Look around for models and services (the setup screen).
+    OpenSetup,
+    /// Save the recommended settings.
+    SaveSetup,
+    /// Close setup without saving, and stop asking at launch.
+    SkipSetup,
+    /// Switch to the named profile.
+    SwitchProfile(String),
+}
+
+/// Turns a saved config into the settings the session runs with.
+///
+/// The second argument is a profile picked while running; `None` means the launch profile.
+pub type Resolver = Arc<dyn Fn(&Config, Option<&str>) -> Result<Settings> + Send + Sync>;
+
+/// The setup screen's content.
+// One value lives in `App` at a time, so the size difference between variants is harmless.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetupState {
+    /// Still looking around.
+    Probing,
+    /// Findings are in; `config` is what saving would write.
+    Ready { lines: Vec<String>, config: Config },
+    /// Saved; shows the confirmation.
+    Done(String),
 }
 
 /// Everything the screen shows.
@@ -141,6 +171,11 @@ pub struct App {
     pub turns: Vec<Turn>,
     pub backend_label: String,
     pub speak_enabled: bool,
+    /// The setup screen, when it is open.
+    pub setup: Option<SetupState>,
+    /// The profile in use, and every profile `p` can switch to.
+    pub profile: String,
+    pub profiles: Vec<String>,
     next_id: usize,
     started: Option<Instant>,
 }
@@ -164,6 +199,9 @@ impl App {
             mode: Mode::Notes,
             turns: Vec::new(),
             backend_label: String::new(),
+            setup: None,
+            profile: String::new(),
+            profiles: Vec::new(),
             speak_enabled: true,
             next_id: 0,
             started: None,
@@ -193,6 +231,7 @@ impl App {
         self.turns.push(Turn {
             user,
             reply: Reply::Pending,
+            thinking: String::new(),
         });
         self.scroll = 0;
     }
@@ -201,6 +240,32 @@ impl App {
     pub fn set_reply(&mut self, reply: Reply) {
         if let Some(turn) = self.turns.last_mut() {
             turn.reply = reply;
+        }
+    }
+
+    /// Show which profile is in use and which others can be switched to.
+    #[must_use]
+    pub fn with_profiles(mut self, profile: String, profiles: Vec<String>) -> Self {
+        self.profile = profile;
+        self.profiles = profiles;
+        self
+    }
+
+    /// The profile after the current one, wrapping around; `None` if there is no choice.
+    #[must_use]
+    pub fn next_profile(&self) -> Option<String> {
+        if self.profiles.len() < 2 {
+            return None;
+        }
+        let at = self.profiles.iter().position(|p| *p == self.profile);
+        let next = at.map_or(0, |i| (i + 1) % self.profiles.len());
+        Some(self.profiles[next].clone())
+    }
+
+    /// Add streamed reasoning to the latest turn.
+    pub fn append_thinking(&mut self, delta: &str) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.thinking.push_str(delta);
         }
     }
 
@@ -330,10 +395,17 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        if self.setup.is_some() {
+            return self.on_setup_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('u') if self.idle() => return Some(Action::OpenSetup),
+            KeyCode::Char('p') if self.idle() => {
+                return self.next_profile().map(Action::SwitchProfile);
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 return match self.phase {
                     Phase::Idle | Phase::Done => Some(Action::Start),
@@ -365,6 +437,47 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// Keys while the setup screen is open.
+    fn on_setup_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            return None;
+        }
+        if key.code == KeyCode::Char('q') {
+            self.quit = true;
+            return None;
+        }
+        match &self.setup {
+            None => None,
+            Some(SetupState::Probing) => match key.code {
+                KeyCode::Char('s') | KeyCode::Esc => Some(Action::SkipSetup),
+                _ => None,
+            },
+            Some(SetupState::Done(_)) => {
+                self.setup = None;
+                None
+            }
+            Some(SetupState::Ready { config, .. }) => {
+                let nothing_to_save = *config == Config::default();
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('y') if nothing_to_save => {
+                        self.setup = None;
+                        None
+                    }
+                    KeyCode::Enter | KeyCode::Char('y') => Some(Action::SaveSetup),
+                    KeyCode::Char('s') | KeyCode::Esc => Some(Action::SkipSetup),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Update what the header shows after the settings changed.
+    pub fn reconfigure(&mut self, backend_label: String, speak_enabled: bool) {
+        self.backend_label = backend_label;
+        self.speak_enabled = speak_enabled;
     }
 
     fn scroll_up(&mut self, n: usize) {
@@ -411,6 +524,10 @@ fn clock(d: Duration) -> String {
 
 /// Render the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
+    if let Some(setup) = &app.setup {
+        draw_setup(frame, setup);
+        return;
+    }
     let [header, meter, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(5),
@@ -476,10 +593,17 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             ]
         }
         Mode::Talk => {
-            let mut spans = vec![
-                Span::styled("talk · ", Style::new().fg(DIM)),
-                Span::styled(app.backend_label.clone(), Style::new().fg(ACCENT)),
-            ];
+            let mut spans = vec![Span::styled("talk · ", Style::new().fg(DIM))];
+            if !app.profile.is_empty() {
+                spans.push(Span::styled(
+                    format!("{} · ", app.profile),
+                    Style::new().fg(GOOD).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(
+                app.backend_label.clone(),
+                Style::new().fg(ACCENT),
+            ));
             if !app.speak_enabled {
                 spans.push(Span::styled(" · muted", Style::new().fg(DIM)));
             }
@@ -635,6 +759,23 @@ fn tail(lines: Vec<Line<'static>>, width: usize, height: usize) -> Vec<Line<'sta
     picked
 }
 
+/// What to show while the assistant has not started answering: the tail of its reasoning when
+/// there is some, else a plain "thinking".
+fn thinking_label(thinking: &str) -> String {
+    const TAIL: usize = 160;
+    let flat = thinking.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return "… thinking".to_string();
+    }
+    let chars: Vec<char> = flat.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(TAIL)..].iter().collect();
+    if chars.len() > TAIL {
+        format!("… thinking: …{tail}")
+    } else {
+        format!("… thinking: {tail}")
+    }
+}
+
 /// The talk-mode lines: each turn's question and answer, then the question being spoken now.
 fn conversation_lines(app: &App) -> Vec<Line<'static>> {
     let who = |name: &'static str, color: Color| {
@@ -649,7 +790,7 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
         ]));
         let answer = match &turn.reply {
             Reply::Pending => Span::styled(
-                "… thinking",
+                thinking_label(&turn.thinking),
                 Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
             ),
             Reply::Partial(t) => Span::raw(format!("{t}▌")),
@@ -697,6 +838,99 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// One line of the setup report, coloured by its marker.
+fn setup_line(text: &str) -> Line<'static> {
+    let trimmed = text.trim_start();
+    let color = if trimmed.starts_with("[ok]") {
+        Some(GOOD)
+    } else if trimmed.starts_with("[~~]") {
+        Some(WARN)
+    } else if trimmed.starts_with("[!!]") {
+        Some(BAD)
+    } else {
+        None
+    };
+    let style = match color {
+        Some(c) => Style::new().fg(c),
+        None if !text.is_empty() && !text.starts_with(' ') => {
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+        }
+        None => Style::new(),
+    };
+    Line::from(Span::styled(text.to_string(), style))
+}
+
+/// The first-run / `u` setup screen.
+fn draw_setup(frame: &mut Frame, setup: &SetupState) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(frame.area());
+    let block = panel("Voice Notes · Setup");
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+
+    let (lines, keys): (Vec<Line<'static>>, Vec<(&'static str, &'static str)>) = match setup {
+        SetupState::Probing => (
+            vec![Line::from(Span::styled(
+                "Looking around and timing your models… this can take a minute if they have to load first.",
+                Style::new().fg(DIM),
+            ))],
+            vec![("s", " skip"), ("q", " quit")],
+        ),
+        SetupState::Ready { lines, config } => {
+            let keys = if *config == Config::default() {
+                vec![
+                    ("Enter", " close"),
+                    ("s", " don't ask again"),
+                    ("q", " quit"),
+                ]
+            } else {
+                vec![("Enter", " save"), ("s", " skip"), ("q", " quit")]
+            };
+            (lines.iter().map(|l| setup_line(l)).collect(), keys)
+        }
+        SetupState::Done(message) => (
+            vec![Line::from(Span::styled(
+                message.clone(),
+                Style::new().fg(GOOD),
+            ))],
+            vec![("any key", " continue")],
+        ),
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, what)) in keys.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::new().fg(DIM)));
+        }
+        spans.push(Span::styled(
+            key,
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(what, Style::new().fg(DIM)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), footer);
+}
+
+/// Turn the findings into what the setup screen shows.
+fn setup_state(found: &Findings) -> SetupState {
+    let plan = setup::plan(found);
+    let text = setup::render(found, &plan);
+    // Drop the report's own title and the blank line after it.
+    let mut lines: Vec<String> = text.lines().skip(2).map(ToString::to_string).collect();
+    if plan.config != Config::default()
+        && let Ok(toml) = plan.config.render()
+    {
+        lines.push(String::new());
+        lines.push("Will save".to_string());
+        lines.extend(toml.lines().map(|l| format!("  {l}")));
+    }
+    SetupState::Ready {
+        lines,
+        config: plan.config,
+    }
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let key =
         |k: &'static str| Span::styled(k, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
@@ -707,10 +941,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Phase::Finishing | Phase::Cleaning | Phase::Thinking => " wait",
         Phase::Idle | Phase::Done => " start",
     };
-    let sep = || text("  ·  ");
+    let sep = || text(" · ");
     let mut spans = vec![Span::raw(" "), key("Enter"), text(action)];
     if app.idle() {
         spans.extend([
+            sep(),
+            key("u"),
+            text(" setup"),
+            sep(),
+            key("p"),
+            text(" profile"),
             sep(),
             key("t"),
             text(if app.mode == Mode::Talk {
@@ -726,14 +966,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         spans.extend([sep(), key("c"), text(" clean")]);
     }
-    spans.extend([
-        sep(),
-        key("↑↓"),
-        text(" scroll"),
-        sep(),
-        key("q"),
-        text(" quit"),
-    ]);
+    spans.extend([sep(), key("↑↓"), sep(), key("q"), text(" quit")]);
     if let Some(notice) = &app.notice {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(notice.clone(), Style::new().fg(BAD)));
@@ -746,9 +979,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 /// # Errors
 ///
 /// Returns an error if the terminal cannot be drawn to or read from.
-pub async fn run(settings: Settings) -> Result<String> {
+pub async fn run(settings: Settings, resolve: Resolver, config: Config) -> Result<String> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, settings).await;
+    let result = event_loop(&mut terminal, settings, resolve, config).await;
     ratatui::restore();
     result
 }
@@ -764,15 +997,23 @@ struct Session {
     reply_task: Option<JoinHandle<Result<String>>>,
     cleaning: Option<JoinHandle<Result<String>>>,
     /// Pieces of the assistant's answer as they stream in.
-    deltas_tx: UnboundedSender<String>,
-    deltas_rx: UnboundedReceiver<String>,
+    deltas_tx: UnboundedSender<ReplyDelta>,
+    deltas_rx: UnboundedReceiver<ReplyDelta>,
     splitter: SentenceSplitter,
     /// Speech was skipped or failed; stay quiet for the rest of this answer.
     silenced: bool,
+    /// Some of the current answer has arrived as streamed text.
+    text_seen: bool,
+    /// The saved config in use, for resolving profiles.
+    config: Config,
+    /// Looking around for models and services (setup screen).
+    probe_task: Option<JoinHandle<Findings>>,
+    /// Builds settings from a freshly saved config.
+    resolve: Resolver,
 }
 
 impl Session {
-    fn new(settings: &Settings) -> Self {
+    fn new(settings: &Settings, resolve: Resolver, config: Config) -> Self {
         let client = reqwest::Client::new();
         let opts = TranscribeOptions {
             language: settings.language.clone(),
@@ -786,14 +1027,23 @@ impl Session {
             client,
             jobs,
             outcomes,
-            conversation: Arc::new(Mutex::new(Conversation::new(settings.backend.clone()))),
+            conversation: Arc::new(Mutex::new(Self::conversation(settings))),
             reply_task: None,
             cleaning: None,
             deltas_tx,
             deltas_rx,
             splitter: SentenceSplitter::default(),
             silenced: false,
+            text_seen: false,
+            config,
+            probe_task: None,
+            resolve,
         }
+    }
+
+    /// A fresh conversation for the backend and prompt in `settings`.
+    fn conversation(settings: &Settings) -> Conversation {
+        Conversation::new(settings.backend.clone()).with_prompt(settings.system_prompt.clone())
     }
 
     /// Apply transcriptions that finished since the last tick.
@@ -863,7 +1113,89 @@ impl Session {
                 }
             }
             Action::NewConversation => self.conversation.lock().await.reset(),
+            Action::OpenSetup => self.start_probe(app),
+            Action::SaveSetup => self.save_setup(app),
+            Action::SkipSetup => self.skip_setup(app),
+            Action::SwitchProfile(name) => self.switch_profile(app, &name),
         }
+    }
+
+    /// Switch to another profile; the conversation starts afresh with the new model and prompt.
+    fn switch_profile(&mut self, app: &mut App, name: &str) {
+        match (self.resolve)(&self.config, Some(name)) {
+            Ok(settings) => {
+                self.apply(app, &settings);
+                app.turns.clear();
+                app.scroll = 0;
+                app.notice = None;
+            }
+            Err(e) => app.notice = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Open the setup screen and look around in the background.
+    fn start_probe(&mut self, app: &mut App) {
+        app.setup = Some(SetupState::Probing);
+        let client = self.client.clone();
+        self.probe_task = Some(tokio::spawn(
+            async move { setup::probe(&client, false).await },
+        ));
+    }
+
+    /// Save the recommended settings and start using them straight away.
+    fn save_setup(&mut self, app: &mut App) {
+        let Some(SetupState::Ready { config, .. }) = &app.setup else {
+            return;
+        };
+        let saved = match Config::load() {
+            Ok(saved) => saved,
+            Err(e) => {
+                app.notice = Some(format!("not saved: {e:#}"));
+                app.setup = None;
+                return;
+            }
+        };
+        let merged = setup::overlay(saved, config);
+        match merged.save() {
+            Ok(path) => {
+                self.config = merged;
+                match (self.resolve)(&self.config, None) {
+                    Ok(settings) => self.apply(app, &settings),
+                    Err(e) => app.notice = Some(format!("{e:#}")),
+                }
+                app.setup = Some(SetupState::Done(format!(
+                    "Saved to {}. These settings are in use now.",
+                    path.display()
+                )));
+            }
+            Err(e) => {
+                app.notice = Some(format!("not saved: {e:#}"));
+                app.setup = None;
+            }
+        }
+    }
+
+    /// Close setup; leave an empty config behind so launch stops asking.
+    fn skip_setup(&mut self, app: &mut App) {
+        if let Some(task) = self.probe_task.take() {
+            task.abort();
+        }
+        if let Some(path) = Config::path()
+            && !path.exists()
+        {
+            let _ = Config::default().save();
+        }
+        app.setup = None;
+    }
+
+    /// Switch the running session to new settings.
+    fn apply(&mut self, app: &mut App, settings: &Settings) {
+        self.conversation = Arc::new(Mutex::new(Self::conversation(settings)));
+        self.speaker.stop();
+        self.speaker = Speaker::new(settings.speech.clone());
+        app.reconfigure(settings.backend.label(), settings.speak);
+        app.profile.clone_from(&settings.profile);
+        app.profiles.clone_from(&settings.profiles);
     }
 
     /// Stop the recorder and send any trailing utterance to the transcriber.
@@ -907,6 +1239,7 @@ impl Session {
                 app.phase = Phase::Thinking;
                 self.splitter = SentenceSplitter::default();
                 self.silenced = false;
+                self.text_seen = false;
                 let conversation = Arc::clone(&self.conversation);
                 let deltas = self.deltas_tx.clone();
                 self.reply_task = Some(tokio::spawn(async move {
@@ -929,6 +1262,21 @@ impl Session {
 
     /// Pick up the cleaned text or the assistant's answer once their tasks finish.
     async fn finish_tasks(&mut self, app: &mut App) {
+        if self
+            .probe_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.probe_task.take()
+        {
+            match handle.await {
+                Ok(found) => app.setup = Some(setup_state(&found)),
+                Err(e) => {
+                    app.notice = Some(format!("setup check failed: {e}"));
+                    app.setup = None;
+                }
+            }
+        }
+
         if self.cleaning.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.cleaning.take()
         {
@@ -950,12 +1298,14 @@ impl Session {
             self.collect_deltas(app);
             match handle.await {
                 Ok(Ok(reply)) => {
-                    app.set_reply(Reply::Text(reply));
-                    if app.speak_enabled
-                        && !self.silenced
-                        && let Some(rest) = self.splitter.finish()
-                    {
-                        self.say(app, &rest);
+                    app.set_reply(Reply::Text(reply.clone()));
+                    if app.speak_enabled && !self.silenced {
+                        if let Some(rest) = self.splitter.finish() {
+                            self.say(app, &rest);
+                        } else if !self.text_seen {
+                            // The answer never arrived as streamed text, so say it all now.
+                            self.say(app, &reply);
+                        }
                     }
                 }
                 Ok(Err(e)) => app.set_reply(Reply::Failed(format!("{e:#}"))),
@@ -984,10 +1334,16 @@ impl Session {
     /// Show streamed pieces of the answer and speak each sentence as soon as it is complete.
     fn collect_deltas(&mut self, app: &mut App) {
         while let Ok(delta) = self.deltas_rx.try_recv() {
-            app.append_reply(&delta);
-            if app.speak_enabled && !self.silenced {
-                for sentence in self.splitter.push(&delta) {
-                    self.say(app, &sentence);
+            match delta {
+                ReplyDelta::Thinking(reasoning) => app.append_thinking(&reasoning),
+                ReplyDelta::Text(text) => {
+                    self.text_seen = true;
+                    app.append_reply(&text);
+                    if app.speak_enabled && !self.silenced {
+                        for sentence in self.splitter.push(&text) {
+                            self.say(app, &sentence);
+                        }
+                    }
                 }
             }
         }
@@ -1010,10 +1366,20 @@ impl Session {
     }
 }
 
-async fn event_loop(terminal: &mut DefaultTerminal, settings: Settings) -> Result<String> {
-    let mut session = Session::new(&settings);
-    let mut app =
-        App::new(settings.clean).with_talk(settings.talk, settings.backend.label(), settings.speak);
+async fn event_loop(
+    terminal: &mut DefaultTerminal,
+    settings: Settings,
+    resolve: Resolver,
+    config: Config,
+) -> Result<String> {
+    let mut session = Session::new(&settings, resolve, config);
+    let mut app = App::new(settings.clean)
+        .with_talk(settings.talk, settings.backend.label(), settings.speak)
+        .with_profiles(settings.profile.clone(), settings.profiles.clone());
+    // First launch: no saved config yet, so offer to set things up.
+    if Config::path().is_some_and(|path| !path.exists()) {
+        session.start_probe(&mut app);
+    }
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
     while !app.quit {
@@ -1420,6 +1786,312 @@ mod talk_tests {
     fn append_without_a_turn_is_ignored() {
         let mut app = talk_app();
         app.append_reply("stray");
+        assert!(app.turns.is_empty());
+    }
+}
+
+/// Tests for the setup screen.
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn found_everything() -> Findings {
+        Findings {
+            models: Some(vec!["whisper".into(), "qwen3-coder-30b".into()]),
+            kokoro_url: Some("http://127.0.0.1:8880/v1/audio/speech".into()),
+            system_voice: Some("espeak-ng"),
+            player: Some("paplay"),
+            claude: false,
+            ..Findings::default()
+        }
+    }
+
+    fn ready(found: &Findings) -> App {
+        let mut app = App::new(false);
+        app.setup = Some(setup_state(found));
+        app
+    }
+
+    /// `u` opens setup only when nothing else is going on.
+    #[test]
+    fn u_opens_setup_when_idle() {
+        let mut app = App::new(false);
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('u'))),
+            Some(Action::OpenSetup)
+        );
+        app.phase = Phase::Listening;
+        assert_eq!(app.on_key(press(KeyCode::Char('u'))), None);
+    }
+
+    /// While looking around, Enter and other keys do nothing; `s` or Esc skips and `q` quits.
+    #[test]
+    fn probing_allows_skip_and_quit_only() {
+        let mut app = App::new(false);
+        app.setup = Some(SetupState::Probing);
+        assert_eq!(app.on_key(press(KeyCode::Enter)), None);
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), None);
+        assert!(app.setup.is_some() && !app.quit);
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('s'))),
+            Some(Action::SkipSetup)
+        );
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Some(Action::SkipSetup));
+        app.on_key(press(KeyCode::Char('q')));
+        assert!(app.quit);
+    }
+
+    /// With something to save, Enter or `y` saves, and `s` or Esc skips.
+    #[test]
+    fn ready_screen_keys() {
+        let mut app = ready(&found_everything());
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Some(Action::SaveSetup));
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('y'))),
+            Some(Action::SaveSetup)
+        );
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('s'))),
+            Some(Action::SkipSetup)
+        );
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Some(Action::SkipSetup));
+        assert!(
+            app.setup.is_some(),
+            "the screen stays until the action is carried out"
+        );
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), None);
+    }
+
+    /// When nothing was found there is nothing to save, so Enter just closes the screen.
+    #[test]
+    fn nothing_found_closes_on_enter() {
+        let mut app = ready(&Findings::default());
+        assert_eq!(app.on_key(press(KeyCode::Enter)), None);
+        assert!(app.setup.is_none());
+    }
+
+    /// After saving, any key returns to the main screen.
+    #[test]
+    fn done_screen_closes_on_any_key() {
+        let mut app = App::new(false);
+        app.setup = Some(SetupState::Done("Saved.".into()));
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), None);
+        assert!(app.setup.is_none());
+    }
+
+    /// Findings become report lines plus the exact settings that would be saved.
+    #[test]
+    fn findings_become_a_report_and_a_config() {
+        let SetupState::Ready { lines, config } = setup_state(&found_everything()) else {
+            panic!("expected a ready state");
+        };
+        let text = lines.join("\n");
+        assert!(text.contains("[ok] Chat"), "{text}");
+        assert!(text.contains("Will save") && text.contains("chat_model = \"qwen3-coder-30b\""));
+        assert!(
+            !text.contains("Voice Notes setup"),
+            "the report's own title is dropped"
+        );
+        assert_eq!(config.chat_model.as_deref(), Some("qwen3-coder-30b"));
+
+        let SetupState::Ready { lines, config } = setup_state(&Findings::default()) else {
+            panic!("expected a ready state");
+        };
+        assert_eq!(config, Config::default());
+        let text = lines.join("\n");
+        assert!(text.contains("managed install") && !text.contains("Will save"));
+    }
+
+    /// The setup screen replaces the main screen and shows the right keys for each state.
+    #[test]
+    fn draws_each_setup_state() {
+        let mut app = App::new(false);
+        app.setup = Some(SetupState::Probing);
+        let text = screen(&app);
+        assert!(text.contains("Setup") && text.contains("Looking around"));
+        assert!(!text.contains("Input"), "the main screen is hidden");
+
+        let text = screen(&ready(&found_everything()));
+        for expected in ["Kokoro at", "Will save", " save", " skip", " quit"] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+
+        let text = screen(&ready(&Findings::default()));
+        assert!(text.contains("preview, not available yet") && text.contains("Qwen3-8B"));
+        assert!(text.contains("don't ask again"));
+
+        app.setup = Some(SetupState::Done("Saved to /x/config.toml.".into()));
+        assert!(screen(&app).contains("Saved to /x/config.toml."));
+    }
+
+    /// Report markers are coloured so problems stand out.
+    #[test]
+    fn setup_lines_are_coloured_by_marker() {
+        let colour = |text: &str| setup_line(text).spans[0].style.fg;
+        assert_eq!(colour("  [ok] Chat  x"), Some(GOOD));
+        assert_eq!(colour("  [~~] Voice x"), Some(WARN));
+        assert_eq!(colour("  [!!] Server x"), Some(BAD));
+        assert_eq!(colour("What I found"), Some(ACCENT));
+        assert_eq!(colour("  plain"), None);
+    }
+
+    /// The idle screen advertises the setup key.
+    #[test]
+    fn idle_footer_mentions_setup() {
+        assert!(screen(&App::new(false)).contains(" setup"));
+    }
+
+    /// New settings update the header's backend name and speech flag.
+    #[test]
+    fn reconfigure_updates_header_state() {
+        let mut app = App::new(false).with_talk(true, "old".into(), true);
+        app.reconfigure("qwen3-coder-30b".into(), false);
+        assert_eq!(app.backend_label, "qwen3-coder-30b");
+        assert!(!app.speak_enabled);
+        assert!(screen(&app).contains("qwen3-coder-30b") && screen(&app).contains("muted"));
+    }
+}
+
+/// Tests for profiles and the thinking display.
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn app_with_profiles(current: &str) -> App {
+        App::new(false)
+            .with_talk(true, "qwen-reasoner".into(), true)
+            .with_profiles(
+                current.into(),
+                ["fast", "dev", "smart", "think"].map(String::from).to_vec(),
+            )
+    }
+
+    /// `p` asks for the next profile and wraps around after the last one.
+    #[test]
+    fn p_cycles_through_profiles() {
+        let mut app = app_with_profiles("fast");
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('p'))),
+            Some(Action::SwitchProfile("dev".into()))
+        );
+        let mut app = app_with_profiles("think");
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('p'))),
+            Some(Action::SwitchProfile("fast".into()))
+        );
+    }
+
+    /// With one profile, or while busy, `p` does nothing.
+    #[test]
+    fn p_needs_a_choice_and_an_idle_app() {
+        let mut one = App::new(false).with_profiles("fast".into(), vec!["fast".into()]);
+        assert_eq!(one.on_key(press(KeyCode::Char('p'))), None);
+        let mut none = App::new(false);
+        assert_eq!(none.on_key(press(KeyCode::Char('p'))), None);
+        let mut busy = app_with_profiles("fast");
+        busy.phase = Phase::Thinking;
+        assert_eq!(busy.on_key(press(KeyCode::Char('p'))), None);
+        assert_eq!(busy.next_profile().as_deref(), Some("dev"));
+    }
+
+    /// An unknown current profile starts the cycle from the first one.
+    #[test]
+    fn next_profile_from_unknown() {
+        let app = app_with_profiles("gone");
+        assert_eq!(app.next_profile().as_deref(), Some("fast"));
+    }
+
+    /// Talk mode shows the profile and its model; `p` is offered only when there is a choice.
+    #[test]
+    fn header_and_footer_show_the_profile() {
+        let text = screen(&app_with_profiles("smart"));
+        assert!(text.contains("talk · smart · qwen-reasoner"), "{text}");
+        assert!(text.contains(" profile"), "{text}");
+        let single = App::new(false).with_talk(true, "m".into(), true);
+        let text = screen(&single);
+        assert!(
+            text.contains("talk · m") && !text.contains("smart"),
+            "{text}"
+        );
+    }
+
+    /// Reasoning is shown, shortened to its tail, until the answer starts.
+    #[test]
+    fn thinking_label_shows_the_tail() {
+        assert_eq!(thinking_label(""), "… thinking");
+        assert_eq!(thinking_label("   \n "), "… thinking");
+        assert_eq!(
+            thinking_label("Add the numbers.\nCarry one."),
+            "… thinking: Add the numbers. Carry one."
+        );
+        let long = "word ".repeat(100);
+        let label = thinking_label(&long);
+        assert!(
+            label.starts_with("… thinking: …") && label.chars().count() < 190,
+            "{label}"
+        );
+    }
+
+    /// While a `think` answer is pending its reasoning is on screen; once the answer streams the
+    /// reasoning is replaced by the text.
+    #[test]
+    fn reasoning_is_shown_until_the_answer_starts() {
+        let mut app = app_with_profiles("think");
+        app.push_turn("what is two plus two".into());
+        app.append_thinking("Let me add ");
+        app.append_thinking("two and two.");
+        assert!(screen(&app).contains("thinking: Let me add two and two."));
+
+        app.append_reply("Four.");
+        let text = screen(&app);
+        assert!(
+            text.contains("Four.") && !text.contains("Let me add"),
+            "{text}"
+        );
+        assert_eq!(app.turns[0].thinking, "Let me add two and two.");
+    }
+
+    /// Reasoning with no turn to attach to is ignored.
+    #[test]
+    fn thinking_without_a_turn_is_ignored() {
+        let mut app = app_with_profiles("think");
+        app.append_thinking("stray");
         assert!(app.turns.is_empty());
     }
 }
