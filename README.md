@@ -44,3 +44,15 @@ If text lags or nothing appears, run with `--verbose` and compare the `ac-level`
 3. Branch off `upstream/master`, make a focused change with tests, **run `make check` before every push**, push to your fork and open a pull request against `master`. CI runs the same checks and must pass.
 
 Other targets: `make test`, `make nextest`, `make test-cov`, `make clean`.
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs on every pull request and push to `master`. Releases are built by `.github/workflows/release.yml`:
+
+```sh
+make bump-patch                 # bump the version in Cargo.toml and Cargo.lock, then commit it
+git tag v0.1.1 && git push upstream v0.1.1
+```
+
+- A `v*` tag must match the version in `Cargo.toml`; it publishes a GitHub release with `voice-notes.linux-x64.tar.gz` and its `.sha256`.
+- Pushing to the `release` branch (or running the workflow manually) refreshes the rolling `latest` pre-release.

@@ -1,4 +1,4 @@
-.PHONY: code check nextest test nextest-cov test-cov clean upgrade requirements
+.PHONY: code check nextest test nextest-cov test-cov clean upgrade bump-patch requirements
 
 # --- Developer targets (require extra tools; see `make requirements`) ---
 
@@ -47,6 +47,9 @@ clean:
 
 upgrade:
 	@cargo upgrade --verbose
+
+bump-patch:
+	@bash ./scripts/bump_patch_version.sh
 
 requirements:
 	@echo "voice-notes: requirements\n"
