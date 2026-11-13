@@ -10,9 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Lint: format check + clippy pedantic + doc tests
+  # Lint: format check + clippy pedantic + doc tests (Linux and macOS)
   lint:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    name: lint (${{ matrix.os }})
     steps:
       - uses: actions/checkout@v6
 
@@ -23,6 +28,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y libasound2-dev pkg-config build-essential
@@ -59,9 +65,14 @@ jobs:
       - run: cargo deny --log-level error check
       - run: typos
 
-  # Test: cargo nextest
+  # Test: cargo nextest (Linux and macOS)
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.os }})
     steps:
       - uses: actions/checkout@v6
 
@@ -71,6 +82,7 @@ jobs:
           rustup default nightly
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y libasound2-dev pkg-config build-essential

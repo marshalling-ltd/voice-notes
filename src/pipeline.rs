@@ -1,6 +1,7 @@
 //! Shared plumbing between the interfaces: settings and the ordered transcription worker.
 
 use crate::chat::Backend;
+use crate::speech::SpeechConfig;
 use crate::transcribe::{TranscribeOptions, is_hallucination, transcribe_audio};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -21,8 +22,8 @@ pub struct Settings {
     pub backend: Backend,
     /// Speak replies aloud.
     pub speak: bool,
-    /// `espeak-ng` voice.
-    pub voice: String,
+    /// How replies are spoken.
+    pub speech: SpeechConfig,
     /// Start in talk mode instead of notes mode.
     pub talk: bool,
 }

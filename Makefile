@@ -63,4 +63,5 @@ requirements:
 	@cargo install cargo-machete
 	@cargo install cargo-nextest --locked
 	@cargo install typos-cli
-	@echo "System packages (Debian/Ubuntu): sudo apt-get install -y libasound2-dev pkg-config build-essential"
+	@echo "Linux system packages (Debian/Ubuntu): sudo apt-get install -y libasound2-dev pkg-config build-essential espeak-ng"
+	@echo "macOS needs no extra system packages."

@@ -445,11 +445,21 @@ fn capture(stop: &AtomicBool, ready: &mpsc::Sender<Result<u32>>, samples: &Arc<M
     drop(stream);
 }
 
+/// On Linux prefer the `PulseAudio` protocol (served by `PipeWire` and `PulseAudio`); the raw ALSA
+/// default often can't be opened when a sound server owns the hardware.
+#[cfg(target_os = "linux")]
+fn input_host() -> cpal::Host {
+    cpal::host_from_id(cpal::HostId::PulseAudio).unwrap_or_else(|_| cpal::default_host())
+}
+
+/// Elsewhere (macOS) the default host (`CoreAudio`) is the right one.
+#[cfg(not(target_os = "linux"))]
+fn input_host() -> cpal::Host {
+    cpal::default_host()
+}
+
 fn open_stream(samples: &Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32)> {
-    // Prefer the PulseAudio protocol (served by PipeWire and PulseAudio); the raw ALSA
-    // default often can't be opened when a sound server owns the hardware.
-    let host =
-        cpal::host_from_id(cpal::HostId::PulseAudio).unwrap_or_else(|_| cpal::default_host());
+    let host = input_host();
     let device = host
         .default_input_device()
         .context("no default input device found (is a microphone available?)")?;
@@ -457,7 +467,7 @@ fn open_stream(samples: &Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32)> {
         .default_input_config()
         .context("could not get the microphone's input configuration")?;
 
-    let sample_rate = config.sample_rate() as u32;
+    let sample_rate = config.sample_rate();
     let channels = config.channels() as usize;
     let format = config.sample_format();
     let config: cpal::StreamConfig = config.into();

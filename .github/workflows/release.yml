@@ -13,10 +13,21 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Linux x86_64 — release binary packaged as a tarball with a checksum
+  # Build — release binary packaged as a tarball with a checksum, per platform
   # ---------------------------------------------------------------------------
-  build-linux:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: macos-arm64
+            os: macos-15
+          - name: macos-x64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    name: build (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v6
 
@@ -26,6 +37,7 @@ jobs:
           rustup default nightly
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y libasound2-dev pkg-config build-essential
@@ -40,22 +52,26 @@ jobs:
           mkdir -p dist/voice-notes
           cp target/release/voice-notes dist/voice-notes/
           cp README.md dist/voice-notes/
-          tar -C dist -czf voice-notes.linux-x64.tar.gz voice-notes
-          sha256sum voice-notes.linux-x64.tar.gz > voice-notes.linux-x64.tar.gz.sha256
+          tar -C dist -czf "voice-notes.${{ matrix.name }}.tar.gz" voice-notes
+          if command -v sha256sum >/dev/null; then
+            sha256sum "voice-notes.${{ matrix.name }}.tar.gz" > "voice-notes.${{ matrix.name }}.tar.gz.sha256"
+          else
+            shasum -a 256 "voice-notes.${{ matrix.name }}.tar.gz" > "voice-notes.${{ matrix.name }}.tar.gz.sha256"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x64
+          name: ${{ matrix.name }}
           path: |
-            voice-notes.linux-x64.tar.gz
-            voice-notes.linux-x64.tar.gz.sha256
+            voice-notes.${{ matrix.name }}.tar.gz
+            voice-notes.${{ matrix.name }}.tar.gz.sha256
 
   # ---------------------------------------------------------------------------
   # Publish — versioned release on tags, rolling prerelease on the release branch
   # ---------------------------------------------------------------------------
   publish:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
-    needs: [build-linux]
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,8 +94,8 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: linux-x64
           path: artifacts/
+          merge-multiple: true
 
       - name: Create tagged release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -94,7 +110,11 @@ jobs:
 
           | Platform | File | Notes |
           |----------|------|-------|
-          | **Linux** x64 | \`voice-notes.linux-x64.tar.gz\` | Needs ALSA (\`libasound2\`) and a Whisper-compatible server on 127.0.0.1:8080. Verify with the \`.sha256\` file. |
+          | **Linux** x64 | \`voice-notes.linux-x64.tar.gz\` | Needs ALSA (\`libasound2\`), a PipeWire/PulseAudio player (\`paplay\`) and a Whisper-compatible server on 127.0.0.1:8080. |
+          | **macOS** Apple Silicon | \`voice-notes.macos-arm64.tar.gz\` | Allow microphone access for your terminal on first run. |
+          | **macOS** Intel | \`voice-notes.macos-x64.tar.gz\` | Allow microphone access for your terminal on first run. |
+
+          Verify each download with its \`.sha256\` file.
           EOF
           )"
 
@@ -103,10 +123,7 @@ jobs:
           else
             gh release create "$TAG" --title "$TAG" --notes "$NOTES"
           fi
-          gh release upload "$TAG" \
-            artifacts/voice-notes.linux-x64.tar.gz \
-            artifacts/voice-notes.linux-x64.tar.gz.sha256 \
-            --clobber
+          gh release upload "$TAG" artifacts/* --clobber
 
       - name: Create/update latest release mirror
         env:
@@ -129,5 +146,4 @@ jobs:
           ${CONTEXT_LINE}
           EOF
           )" \
-            artifacts/voice-notes.linux-x64.tar.gz \
-            artifacts/voice-notes.linux-x64.tar.gz.sha256
+            artifacts/*
