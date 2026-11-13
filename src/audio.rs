@@ -140,6 +140,33 @@ impl Segmenter {
     }
 }
 
+/// Records from the default microphone and splits the audio into utterances on silence.
+///
+/// After [`start_recording`](Self::start_recording) the recorder measures about a second of
+/// ambient noise to set its speech gate, then [`poll_segments`](Self::poll_segments) returns
+/// each finished utterance as 16 kHz mono WAV bytes while recording continues.
+///
+/// # Examples
+///
+/// ```no_run
+/// use voice_notes::audio::AudioRecorder;
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let mut recorder = AudioRecorder::new(0.01, false);
+/// recorder.start_recording()?;
+///
+/// // Call this regularly (the app polls every 100 ms).
+/// for wav in recorder.poll_segments()? {
+///     println!("utterance of {} bytes", wav.len());
+/// }
+///
+/// // Stopping returns any speech still in progress.
+/// if let Some(wav) = recorder.stop_recording()? {
+///     println!("trailing utterance of {} bytes", wav.len());
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct AudioRecorder {
     min_threshold: f32,
     threshold: Option<f32>,
@@ -155,7 +182,19 @@ pub struct AudioRecorder {
 
 impl AudioRecorder {
     /// `min_threshold` is the lowest RMS level (0.0-1.0) ever treated as speech; the real
-    /// gate is calibrated from ambient noise after recording starts.
+    /// gate is calibrated from ambient noise after recording starts. With `verbose`, the live
+    /// input level is printed to stderr while polling.
+    ///
+    /// # Examples
+    ///
+    /// Creating a recorder does not touch the microphone, so no gate exists yet:
+    ///
+    /// ```
+    /// use voice_notes::audio::AudioRecorder;
+    ///
+    /// let recorder = AudioRecorder::new(0.01, false);
+    /// assert_eq!(recorder.calibrated_threshold(), None);
+    /// ```
     #[must_use]
     pub fn new(min_threshold: f32, verbose: bool) -> Self {
         Self {
@@ -178,6 +217,20 @@ impl AudioRecorder {
     ///
     /// Returns an error immediately if already recording, or if the input device cannot be
     /// found, configured or started.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use voice_notes::audio::AudioRecorder;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let mut recorder = AudioRecorder::new(0.01, false);
+    /// recorder.start_recording()?;
+    /// // Starting twice is rejected.
+    /// assert!(recorder.start_recording().is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn start_recording(&mut self) -> Result<()> {
         if self.worker.is_some() {
             bail!("already recording");
@@ -225,6 +278,23 @@ impl AudioRecorder {
     }
 
     /// The calibrated speech gate, or `None` while still measuring ambient noise.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use voice_notes::audio::AudioRecorder;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let mut recorder = AudioRecorder::new(0.01, false);
+    /// recorder.start_recording()?;
+    /// while recorder.calibrated_threshold().is_none() {
+    ///     recorder.poll_segments()?; // calibration advances as audio is polled
+    ///     std::thread::sleep(std::time::Duration::from_millis(100));
+    /// }
+    /// println!("speech gate: {:.3}", recorder.calibrated_threshold().unwrap());
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn calibrated_threshold(&self) -> Option<f32> {
         self.threshold
@@ -255,6 +325,17 @@ impl AudioRecorder {
     /// # Errors
     ///
     /// Returns an error if not recording, or if the capture buffer or WAV encoding fails.
+    ///
+    /// # Examples
+    ///
+    /// Polling a recorder that was never started is an error:
+    ///
+    /// ```
+    /// use voice_notes::audio::AudioRecorder;
+    ///
+    /// let mut recorder = AudioRecorder::new(0.01, false);
+    /// assert!(recorder.poll_segments().is_err());
+    /// ```
     pub fn poll_segments(&mut self) -> Result<Vec<Vec<u8>>> {
         if self.worker.is_none() {
             bail!("not recording");
@@ -280,6 +361,17 @@ impl AudioRecorder {
     /// # Errors
     ///
     /// Returns an error if not recording, the audio thread panicked, or WAV encoding fails.
+    ///
+    /// # Examples
+    ///
+    /// Stopping a recorder that was never started is an error:
+    ///
+    /// ```
+    /// use voice_notes::audio::AudioRecorder;
+    ///
+    /// let mut recorder = AudioRecorder::new(0.01, false);
+    /// assert!(recorder.stop_recording().is_err());
+    /// ```
     pub fn stop_recording(&mut self) -> Result<Option<Vec<u8>>> {
         self.stop_flag.store(true, Ordering::Relaxed);
         let worker = self.worker.take().context("not recording")?;
@@ -423,17 +515,21 @@ fn encode_wav(samples: &[f32]) -> Result<Vec<u8>> {
     Ok(wav_buffer)
 }
 
+/// Unit tests for the silence-based [`Segmenter`].
 #[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 
+    /// Generate a sine tone of `ms` milliseconds at amplitude `amp`, standing in for speech.
     fn tone(rate: u32, ms: usize, amp: f32) -> Vec<f32> {
         (0..rate as usize * ms / 1000)
             .map(|i| amp * (i as f32 * 0.3).sin())
             .collect()
     }
 
+    /// Two bursts of speech separated by a pause longer than the silence limit must come out
+    /// as two separate segments, with nothing left buffered afterwards.
     #[test]
     fn splits_on_silence() {
         let mut seg = Segmenter::new(16_000, 0.01);
@@ -446,6 +542,8 @@ mod tests {
         assert!(seg.finish().is_none());
     }
 
+    /// Pure silence and a click shorter than the minimum speech length are treated as noise,
+    /// so no segment is emitted and nothing is flushed at the end.
     #[test]
     fn drops_noise_blips_and_silence() {
         let mut seg = Segmenter::new(16_000, 0.01);
@@ -456,6 +554,8 @@ mod tests {
         assert!(seg.finish().is_none());
     }
 
+    /// Speech that is still in progress when recording stops has no trailing pause, so it is
+    /// not emitted by `push` but must be returned by `finish`.
     #[test]
     fn finish_flushes_trailing_speech() {
         let mut seg = Segmenter::new(16_000, 0.01);
@@ -467,11 +567,14 @@ mod tests {
     }
 }
 
+/// Unit tests for the ambient-noise calibration.
 #[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 mod calibration_tests {
     use super::*;
 
+    /// A very quiet room keeps the configured minimum gate, while a noisy room raises the gate
+    /// to just above the measured noise (1.5x the 95th-percentile level, about 0.1 to 0.2 here).
     #[test]
     fn gate_scales_with_ambient_noise() {
         let quiet = vec![0.0005_f32; 16_000];

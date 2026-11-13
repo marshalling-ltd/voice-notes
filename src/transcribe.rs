@@ -31,6 +31,23 @@ struct Choice {
 }
 
 /// Settings that steer Whisper away from inventing text.
+///
+/// # Examples
+///
+/// ```
+/// use voice_notes::transcribe::TranscribeOptions;
+///
+/// // Force English and bias recognition towards some vocabulary.
+/// let opts = TranscribeOptions {
+///     language: Some("en".to_string()),
+///     prompt: Some("Marshalling, Whisper, PipeWire".to_string()),
+/// };
+/// assert_eq!(opts.language.as_deref(), Some("en"));
+///
+/// // The default lets the server auto-detect the language and sends no prompt.
+/// let auto = TranscribeOptions::default();
+/// assert!(auto.language.is_none() && auto.prompt.is_none());
+/// ```
 #[derive(Clone, Default)]
 pub struct TranscribeOptions {
     /// ISO language code such as "en"; `None` lets the server auto-detect.
@@ -55,6 +72,22 @@ const STOCK_PHRASES: &[&str] = &[
 ];
 
 /// Heuristics for text Whisper typically makes up from noise or near-silence.
+///
+/// Flags stock phrases (`you`, `Thank you`), subtitle credits, subtitle-style dialogue
+/// markers, empty text, and one word looping five or more times.
+///
+/// # Examples
+///
+/// ```
+/// use voice_notes::transcribe::is_hallucination;
+///
+/// assert!(is_hallucination("Thanks for watching!"));
+/// assert!(is_hallucination("- Yeah? - I'll be there."));
+/// assert!(is_hallucination("no no no no no no"));
+///
+/// assert!(!is_hallucination("Are you working?"));
+/// assert!(!is_hallucination("Thank you for the update on the report."));
+/// ```
 #[must_use]
 pub fn is_hallucination(text: &str) -> bool {
     let lower = text.trim().to_lowercase();
@@ -94,6 +127,22 @@ pub fn is_hallucination(text: &str) -> bool {
 ///
 /// Returns an error if the request fails, the server answers with an error status, or the
 /// response is not the expected JSON.
+///
+/// # Examples
+///
+/// ```no_run
+/// use voice_notes::transcribe::{transcribe_audio, TranscribeOptions};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> anyhow::Result<()> {
+/// let client = reqwest::Client::new();
+/// let wav = std::fs::read("note.wav")?; // 16 kHz mono 16-bit WAV
+/// let opts = TranscribeOptions { language: Some("en".into()), prompt: None };
+/// let text = transcribe_audio(&client, &wav, &opts).await?;
+/// println!("{text}");
+/// # Ok(())
+/// # }
+/// ```
 pub async fn transcribe_audio(
     client: &Client,
     audio_data: &[u8],
@@ -134,6 +183,20 @@ pub async fn transcribe_audio(
 ///
 /// Returns an error if the request fails, the server answers with an error status, or the
 /// response is not the expected JSON.
+///
+/// # Examples
+///
+/// ```no_run
+/// use voice_notes::transcribe::clean_transcript;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> anyhow::Result<()> {
+/// let client = reqwest::Client::new();
+/// let cleaned = clean_transcript(&client, "so um i think its a little bit slow").await?;
+/// println!("{cleaned}"); // e.g. "I think it's a little bit slow."
+/// # Ok(())
+/// # }
+/// ```
 pub async fn clean_transcript(client: &Client, raw_text: &str) -> Result<String> {
     let request = CleanTranscriptRequest {
         model: "qwen3-coder-30b",
@@ -160,10 +223,13 @@ pub async fn clean_transcript(client: &Client, raw_text: &str) -> Result<String>
     Ok(clean_response.choices[0].message.content.clone())
 }
 
+/// Unit tests for the hallucination filter.
 #[cfg(test)]
 mod tests {
     use super::is_hallucination;
 
+    /// Stock phrases, subtitle credits, dialogue markers, looping words and empty text, all
+    /// typical Whisper output for noise or silence, must be flagged.
     #[test]
     fn flags_known_hallucinations() {
         for t in [
@@ -180,6 +246,8 @@ mod tests {
         }
     }
 
+    /// Genuine sentences, including ones that merely contain a stock word such as "you" or
+    /// "thank you", must not be flagged.
     #[test]
     fn keeps_real_speech() {
         for t in [
