@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// Options chosen on the command line.
 // Each bool is an independent command-line switch, not a state machine.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Settings {
     /// Polish the final transcript with the chat model.
     pub clean: bool,
@@ -20,6 +20,12 @@ pub struct Settings {
     pub verbose: bool,
     /// Who answers in talk mode.
     pub backend: Backend,
+    /// System prompt for the chat backend; `None` means the default spoken style.
+    pub system_prompt: Option<String>,
+    /// The profile in use.
+    pub profile: String,
+    /// Every profile that can be switched to, in the order `p` cycles them.
+    pub profiles: Vec<String>,
     /// Speak replies aloud.
     pub speak: bool,
     /// How replies are spoken.

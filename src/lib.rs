@@ -5,6 +5,11 @@
 
 pub mod audio;
 pub mod chat;
+pub mod config;
+pub mod hardware;
+pub mod latency;
+pub mod profile;
+pub mod setup;
 pub mod speech;
 pub mod transcribe;
 

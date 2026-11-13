@@ -190,7 +190,11 @@ struct SpeechRequest<'a> {
 }
 
 /// Ask a Kokoro server for the audio (WAV) of `text`.
-async fn fetch_audio(client: &reqwest::Client, cfg: &KokoroConfig, text: &str) -> Result<Vec<u8>> {
+pub(crate) async fn fetch_audio(
+    client: &reqwest::Client,
+    cfg: &KokoroConfig,
+    text: &str,
+) -> Result<Vec<u8>> {
     let response = client
         .post(&cfg.url)
         .timeout(Duration::from_secs(60))
@@ -211,7 +215,17 @@ async fn fetch_audio(client: &reqwest::Client, cfg: &KokoroConfig, text: &str) -
 }
 
 /// Look for an executable on `PATH`.
-fn find_in_path(name: &str) -> Option<PathBuf> {
+///
+/// # Examples
+///
+/// ```
+/// use voice_notes::speech::find_in_path;
+///
+/// assert!(find_in_path("sh").is_some());
+/// assert!(find_in_path("definitely-not-a-real-program-xyz").is_none());
+/// ```
+#[must_use]
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
