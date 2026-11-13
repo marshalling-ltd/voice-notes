@@ -12,6 +12,16 @@ mod ui;
 
 use chat::Backend;
 use pipeline::Settings;
+use speech::{KokoroConfig, SpeechConfig};
+
+/// How replies are spoken.
+#[derive(Clone, Copy, ValueEnum)]
+enum TtsArg {
+    /// A Kokoro server, falling back to the system voice if it cannot be reached
+    Kokoro,
+    /// The system voice only (`say` on macOS, `espeak-ng` on Linux)
+    System,
+}
 
 /// Who answers in talk mode.
 #[derive(Clone, Copy, ValueEnum)]
@@ -54,7 +64,28 @@ struct Args {
     #[arg(long, default_value = "qwen3-coder-30b")]
     chat_model: String,
 
-    /// espeak-ng voice used to speak replies (e.g. en, en-gb)
+    /// Let reasoning models think before answering (much slower; off by default for talking)
+    #[arg(long)]
+    think: bool,
+
+    /// How replies are spoken
+    #[arg(long, value_enum, default_value = "kokoro")]
+    tts: TtsArg,
+
+    /// Kokoro speech endpoint (OpenAI-compatible `/v1/audio/speech`)
+    #[arg(long, default_value = "http://127.0.0.1:8880/v1/audio/speech")]
+    tts_url: String,
+
+    /// Model name sent to the Kokoro server
+    #[arg(long, default_value = "kokoro")]
+    tts_model: String,
+
+    /// Kokoro voice, e.g. `af_heart`, `af_bella`, `am_michael`, `bf_emma`
+    #[arg(long, default_value = "af_heart")]
+    tts_voice: String,
+
+    /// System voice for --tts system and as the fallback (espeak-ng voice such as en or en-gb;
+    /// a `say` voice on macOS)
     #[arg(long, default_value = "en")]
     voice: String,
 
@@ -78,11 +109,19 @@ async fn main() -> Result<()> {
         backend: match args.backend {
             BackendArg::Local => Backend::Local {
                 model: args.chat_model.clone(),
+                think: args.think,
             },
             BackendArg::Claude => Backend::Claude,
         },
         speak: !args.no_speech,
-        voice: args.voice.clone(),
+        speech: SpeechConfig {
+            kokoro: matches!(args.tts, TtsArg::Kokoro).then(|| KokoroConfig {
+                url: args.tts_url.clone(),
+                model: args.tts_model.clone(),
+                voice: args.tts_voice.clone(),
+            }),
+            ..SpeechConfig::system(args.voice.clone())
+        },
         talk: args.talk,
     };
 

@@ -12,6 +12,11 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
-cpal = { version = "0.18.2", features = ["pulseaudio"] }
+cpal = "0.18.2"
 ratatui = "0.30.2"
 crossterm = "0.29"
+serde_json = "1.0.154"
+
+# PipeWire/PulseAudio microphone access is Linux-only; macOS uses CoreAudio.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pulseaudio"] }

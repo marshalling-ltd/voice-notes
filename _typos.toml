@@ -1,0 +1,3 @@
+[default.extend-words]
+# Names of libraries and models that look like typos.
+ratatui = "ratatui"

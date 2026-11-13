@@ -18,7 +18,7 @@
 use crate::audio::AudioRecorder;
 use crate::chat::Conversation;
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
-use crate::speech::Speaker;
+use crate::speech::{SentenceSplitter, Speaker};
 use crate::transcribe::{TranscribeOptions, clean_transcript};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -78,6 +78,8 @@ pub enum Mode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
     Pending,
+    /// The answer so far, still being written.
+    Partial(String),
     Text(String),
     Failed(String),
 }
@@ -199,6 +201,16 @@ impl App {
     pub fn set_reply(&mut self, reply: Reply) {
         if let Some(turn) = self.turns.last_mut() {
             turn.reply = reply;
+        }
+    }
+
+    /// Add streamed text to the latest turn's answer.
+    pub fn append_reply(&mut self, delta: &str) {
+        if let Some(turn) = self.turns.last_mut() {
+            match &mut turn.reply {
+                Reply::Partial(text) => text.push_str(delta),
+                other => *other = Reply::Partial(delta.to_string()),
+            }
         }
     }
 
@@ -640,6 +652,7 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
                 "… thinking",
                 Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
             ),
+            Reply::Partial(t) => Span::raw(format!("{t}▌")),
             Reply::Text(t) => Span::raw(t.clone()),
             Reply::Failed(e) => Span::styled(format!("✗ {e}"), Style::new().fg(BAD)),
         };
@@ -750,6 +763,12 @@ struct Session {
     conversation: Arc<Mutex<Conversation>>,
     reply_task: Option<JoinHandle<Result<String>>>,
     cleaning: Option<JoinHandle<Result<String>>>,
+    /// Pieces of the assistant's answer as they stream in.
+    deltas_tx: UnboundedSender<String>,
+    deltas_rx: UnboundedReceiver<String>,
+    splitter: SentenceSplitter,
+    /// Speech was skipped or failed; stay quiet for the rest of this answer.
+    silenced: bool,
 }
 
 impl Session {
@@ -760,15 +779,20 @@ impl Session {
             prompt: None,
         };
         let (jobs, outcomes) = spawn_transcriber(client.clone(), opts);
+        let (deltas_tx, deltas_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             recorder: AudioRecorder::new(settings.min_threshold, false),
-            speaker: Speaker::new(settings.voice.clone()),
+            speaker: Speaker::new(settings.speech.clone()),
             client,
             jobs,
             outcomes,
             conversation: Arc::new(Mutex::new(Conversation::new(settings.backend.clone()))),
             reply_task: None,
             cleaning: None,
+            deltas_tx,
+            deltas_rx,
+            splitter: SentenceSplitter::default(),
+            silenced: false,
         }
     }
 
@@ -826,7 +850,12 @@ impl Session {
             Action::Stop => self.stop_recording(app),
             Action::Skip => {
                 self.speaker.stop();
-                app.phase = Phase::Done;
+                self.silenced = true;
+                app.phase = if self.reply_task.is_some() {
+                    Phase::Thinking
+                } else {
+                    Phase::Done
+                };
             }
             Action::ReadAloud => {
                 if let Some(text) = app.readable() {
@@ -853,7 +882,7 @@ impl Session {
     /// Start reading `text` aloud, or report why that is not possible.
     fn speak(&mut self, app: &mut App, text: &str) {
         match self.speaker.speak(text) {
-            Ok(()) if self.speaker.is_speaking() => app.phase = Phase::Speaking,
+            Ok(()) if self.speaker.is_busy() => app.phase = Phase::Speaking,
             Ok(()) => app.phase = Phase::Done,
             Err(e) => {
                 app.notice = Some(format!("{e:#}"));
@@ -876,9 +905,16 @@ impl Session {
             } else {
                 app.push_turn(text.clone());
                 app.phase = Phase::Thinking;
+                self.splitter = SentenceSplitter::default();
+                self.silenced = false;
                 let conversation = Arc::clone(&self.conversation);
+                let deltas = self.deltas_tx.clone();
                 self.reply_task = Some(tokio::spawn(async move {
-                    conversation.lock().await.reply(&client, &text).await
+                    conversation
+                        .lock()
+                        .await
+                        .reply(&client, &text, Some(&deltas))
+                        .await
                 }));
             }
         } else if app.clean && !text.is_empty() {
@@ -910,28 +946,66 @@ impl Session {
             .is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.reply_task.take()
         {
+            // The task is finished, so every piece it produced is already in the channel.
+            self.collect_deltas(app);
             match handle.await {
                 Ok(Ok(reply)) => {
-                    app.set_reply(Reply::Text(reply.clone()));
-                    if app.speak_enabled {
-                        self.speak(app, &reply);
-                    } else {
-                        app.phase = Phase::Done;
+                    app.set_reply(Reply::Text(reply));
+                    if app.speak_enabled
+                        && !self.silenced
+                        && let Some(rest) = self.splitter.finish()
+                    {
+                        self.say(app, &rest);
                     }
                 }
-                Ok(Err(e)) => {
-                    app.set_reply(Reply::Failed(format!("{e:#}")));
-                    app.phase = Phase::Done;
-                }
-                Err(e) => {
-                    app.set_reply(Reply::Failed(e.to_string()));
-                    app.phase = Phase::Done;
+                Ok(Err(e)) => app.set_reply(Reply::Failed(format!("{e:#}"))),
+                Err(e) => app.set_reply(Reply::Failed(e.to_string())),
+            }
+            app.phase = Phase::Thinking; // settled just below
+        }
+
+        if let Err(e) = self.speaker.pump() {
+            app.notice = Some(format!("{e:#}"));
+            self.silenced = true;
+            self.speaker.stop();
+        }
+        if let Some(notice) = self.speaker.take_notice() {
+            app.notice = Some(notice);
+        }
+        if self.reply_task.is_none() && matches!(app.phase, Phase::Thinking | Phase::Speaking) {
+            app.phase = if self.speaker.is_busy() {
+                Phase::Speaking
+            } else {
+                Phase::Done
+            };
+        }
+    }
+
+    /// Show streamed pieces of the answer and speak each sentence as soon as it is complete.
+    fn collect_deltas(&mut self, app: &mut App) {
+        while let Ok(delta) = self.deltas_rx.try_recv() {
+            app.append_reply(&delta);
+            if app.speak_enabled && !self.silenced {
+                for sentence in self.splitter.push(&delta) {
+                    self.say(app, &sentence);
                 }
             }
         }
+    }
 
-        if app.phase == Phase::Speaking && !self.speaker.is_speaking() {
-            app.phase = Phase::Done;
+    /// Queue one sentence for speech; on failure report it and stay quiet.
+    fn say(&mut self, app: &mut App, text: &str) {
+        match self.speaker.enqueue(text) {
+            Ok(()) => {
+                if app.phase == Phase::Thinking && self.speaker.is_busy() {
+                    app.phase = Phase::Speaking;
+                }
+            }
+            Err(e) => {
+                app.notice = Some(format!("{e:#}"));
+                self.silenced = true;
+                self.speaker.stop();
+            }
         }
     }
 }
@@ -952,6 +1026,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, settings: Settings) -> Resul
         if app.quit && app.recording() {
             let _ = session.recorder.stop_recording();
         }
+        session.collect_deltas(&mut app);
         session.advance(&mut app);
         session.finish_tasks(&mut app).await;
     }
@@ -1315,5 +1390,36 @@ mod talk_tests {
         let app = App::new(false).with_talk(true, "claude".to_string(), false);
         let text = screen(&app);
         assert!(text.contains("ask your question") && text.contains("muted"));
+    }
+
+    /// Streamed pieces build up the latest answer, which is shown with a cursor until it is done
+    /// and is not read aloud by `r` while incomplete.
+    #[test]
+    fn streamed_reply_shows_cursor_until_complete() {
+        let mut app = talk_app();
+        app.push_turn("tell me something".into());
+        app.append_reply("Octopuses have ");
+        app.append_reply("three hearts.");
+        assert_eq!(
+            app.turns[0].reply,
+            Reply::Partial("Octopuses have three hearts.".into())
+        );
+        assert_eq!(app.readable(), None);
+        assert!(screen(&app).contains("three hearts.▌"));
+
+        app.set_reply(Reply::Text("Octopuses have three hearts.".into()));
+        assert!(!screen(&app).contains('▌'));
+        assert_eq!(
+            app.readable().as_deref(),
+            Some("Octopuses have three hearts.")
+        );
+    }
+
+    /// Streamed text with no turn to attach to is ignored instead of panicking.
+    #[test]
+    fn append_without_a_turn_is_ignored() {
+        let mut app = talk_app();
+        app.append_reply("stray");
+        assert!(app.turns.is_empty());
     }
 }
