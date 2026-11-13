@@ -1,6 +1,7 @@
 //! Timing the models you have, so setup can say whether they feel fast enough for conversation.
 
 use crate::chat::{Backend, Conversation, ReplyDelta};
+use crate::endpoints::Endpoints;
 use crate::speech::{KokoroConfig, SentenceSplitter, fetch_audio};
 use crate::transcribe::{TranscribeOptions, transcribe_audio};
 use std::time::{Duration, Instant};
@@ -86,6 +87,10 @@ pub struct Latency {
 #[derive(Debug, Default, Clone)]
 pub struct Targets<'a> {
     pub whisper: bool,
+    /// Model name to ask the speech-to-text endpoint for.
+    pub stt_model: String,
+    /// The endpoints to time.
+    pub endpoints: Endpoints,
     pub chat_model: Option<&'a str>,
     pub smart_model: Option<&'a str>,
     pub kokoro_url: Option<&'a str>,
@@ -123,9 +128,13 @@ pub fn test_clip() -> Vec<u8> {
     bytes
 }
 
-async fn time_stt(client: &reqwest::Client) -> Option<Duration> {
+async fn time_stt(client: &reqwest::Client, url: &str, model: &str) -> Option<Duration> {
     let clip = test_clip();
-    let opts = TranscribeOptions::default();
+    let opts = TranscribeOptions {
+        url: url.to_string(),
+        model: model.to_string(),
+        ..TranscribeOptions::default()
+    };
     let mut last = None;
     // The first request may load the model, so the second one is what counts.
     for _ in 0..2 {
@@ -162,11 +171,12 @@ async fn time_voice(client: &reqwest::Client, url: &str) -> Option<Duration> {
 
 /// Time from sending the question until the first whole sentence of the reply is complete.
 /// A one-sentence reply counts as complete when it ends.
-async fn first_sentence(client: &reqwest::Client, model: &str) -> Option<Duration> {
+async fn first_sentence(client: &reqwest::Client, chat_url: &str, model: &str) -> Option<Duration> {
     let mut conversation = Conversation::new(Backend::Local {
         model: model.to_string(),
         think: false,
-    });
+    })
+    .with_url(chat_url.to_string());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let start = Instant::now();
     let task = tokio::spawn({
@@ -195,9 +205,9 @@ async fn first_sentence(client: &reqwest::Client, model: &str) -> Option<Duratio
     first.or_else(|| Some(start.elapsed()))
 }
 
-async fn time_model(client: &reqwest::Client, model: &str) -> Option<ModelSpeed> {
-    let cold = first_sentence(client, model).await?;
-    let warm = first_sentence(client, model).await?;
+async fn time_model(client: &reqwest::Client, chat_url: &str, model: &str) -> Option<ModelSpeed> {
+    let cold = first_sentence(client, chat_url, model).await?;
+    let warm = first_sentence(client, chat_url, model).await?;
     Some(ModelSpeed {
         model: model.to_string(),
         cold,
@@ -209,7 +219,7 @@ async fn time_model(client: &reqwest::Client, model: &str) -> Option<ModelSpeed>
 /// that server is running.
 pub async fn measure(client: &reqwest::Client, targets: &Targets<'_>) -> Latency {
     let stt = if targets.whisper {
-        time_stt(client).await
+        time_stt(client, &targets.endpoints.stt, &targets.stt_model).await
     } else {
         None
     };
@@ -218,11 +228,11 @@ pub async fn measure(client: &reqwest::Client, targets: &Targets<'_>) -> Latency
         None => None,
     };
     let chat = match targets.chat_model {
-        Some(model) => time_model(client, model).await,
+        Some(model) => time_model(client, &targets.endpoints.chat, model).await,
         None => None,
     };
     let smart = match targets.smart_model {
-        Some(model) => time_model(client, model).await,
+        Some(model) => time_model(client, &targets.endpoints.chat, model).await,
         None => None,
     };
     Latency {

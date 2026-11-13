@@ -27,6 +27,16 @@ pub struct Config {
     pub voice: Option<String>,
     /// Spoken language code, or `auto`.
     pub language: Option<String>,
+    /// One server for speech to text, chat and the model list, e.g. `http://gpu-box:8080`.
+    pub server: Option<String>,
+    /// Full URL for speech to text (overrides `server`).
+    pub stt_url: Option<String>,
+    /// Full URL for chat completions (overrides `server`).
+    pub chat_url: Option<String>,
+    /// Full URL for the model list (overrides `server`).
+    pub models_url: Option<String>,
+    /// Model name sent to the speech-to-text endpoint.
+    pub stt_model: Option<String>,
     /// The profile used at launch (`fast` if absent).
     pub profile: Option<String>,
     /// The reasoning model behind the `smart` and `think` profiles.
@@ -209,5 +219,30 @@ mod tests {
         let parsed = Config::parse("[profiles.x]\nthink = true\n").unwrap();
         assert_eq!(parsed.profiles["x"].think, Some(true));
         assert!(parsed.profiles["x"].model.is_none());
+    }
+
+    /// Endpoint and model keys round-trip, and absent ones are not written.
+    #[test]
+    fn endpoint_keys_round_trip() {
+        let config = Config {
+            server: Some("http://gpu-box:8080".into()),
+            stt_url: Some("http://stt-box:9000/v1/audio/transcriptions".into()),
+            chat_url: Some("http://chat-box/v1/chat/completions".into()),
+            models_url: Some("http://chat-box/v1/models".into()),
+            stt_model: Some("whisper-large-v3".into()),
+            ..Config::default()
+        };
+        let text = config.render().unwrap();
+        for expected in [
+            "server = ",
+            "stt_url = ",
+            "chat_url = ",
+            "models_url = ",
+            "stt_model = \"whisper-large-v3\"",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
+        assert_eq!(Config::parse(&text).unwrap(), config);
+        assert!(!Config::default().render().unwrap().contains("server"));
     }
 }

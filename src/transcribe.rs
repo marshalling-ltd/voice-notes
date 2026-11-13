@@ -1,4 +1,5 @@
 use crate::chat::ChatMessage;
+use crate::endpoints::{DEFAULT_STT_MODEL, Endpoints};
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -9,8 +10,8 @@ struct TranscriptionResponse {
 }
 
 #[derive(Serialize)]
-struct CleanTranscriptRequest {
-    model: &'static str,
+struct CleanTranscriptRequest<'a> {
+    model: &'a str,
     messages: Vec<ChatMessage>,
 }
 
@@ -36,6 +37,7 @@ struct Choice {
 /// let opts = TranscribeOptions {
 ///     language: Some("en".to_string()),
 ///     prompt: Some("Marshalling, Whisper, PipeWire".to_string()),
+///     ..TranscribeOptions::default()
 /// };
 /// assert_eq!(opts.language.as_deref(), Some("en"));
 ///
@@ -43,12 +45,28 @@ struct Choice {
 /// let auto = TranscribeOptions::default();
 /// assert!(auto.language.is_none() && auto.prompt.is_none());
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TranscribeOptions {
     /// ISO language code such as "en"; `None` lets the server auto-detect.
     pub language: Option<String>,
     /// Short context prompt; leave `None` unless you have vocabulary to bias towards.
     pub prompt: Option<String>,
+    /// Full URL of the speech-to-text endpoint.
+    pub url: String,
+    /// Model name sent to that endpoint.
+    pub model: String,
+}
+
+impl Default for TranscribeOptions {
+    /// Local server, default model, language auto-detected, no prompt.
+    fn default() -> Self {
+        Self {
+            language: None,
+            prompt: None,
+            url: Endpoints::default().stt,
+            model: DEFAULT_STT_MODEL.to_string(),
+        }
+    }
 }
 
 const STOCK_PHRASES: &[&str] = &[
@@ -132,7 +150,10 @@ pub fn is_hallucination(text: &str) -> bool {
 /// # async fn main() -> anyhow::Result<()> {
 /// let client = reqwest::Client::new();
 /// let wav = std::fs::read("note.wav")?; // 16 kHz mono 16-bit WAV
-/// let opts = TranscribeOptions { language: Some("en".into()), prompt: None };
+/// let opts = TranscribeOptions {
+///     language: Some("en".into()),
+///     ..TranscribeOptions::default()
+/// };
 /// let text = transcribe_audio(&client, &wav, &opts).await?;
 /// println!("{text}");
 /// # Ok(())
@@ -149,7 +170,7 @@ pub async fn transcribe_audio(
 
     let form = reqwest::multipart::Form::new()
         .part("file", part)
-        .text("model", "whisper")
+        .text("model", opts.model.clone())
         .text("response_format", "json")
         .text("temperature", "0");
     let form = match &opts.language {
@@ -162,7 +183,7 @@ pub async fn transcribe_audio(
     };
 
     let response = client
-        .post("http://127.0.0.1:8080/v1/audio/transcriptions")
+        .post(&opts.url)
         .multipart(form)
         .send()
         .await?
@@ -182,19 +203,27 @@ pub async fn transcribe_audio(
 /// # Examples
 ///
 /// ```no_run
+/// use voice_notes::endpoints::Endpoints;
 /// use voice_notes::transcribe::clean_transcript;
 ///
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> anyhow::Result<()> {
 /// let client = reqwest::Client::new();
-/// let cleaned = clean_transcript(&client, "so um i think its a little bit slow").await?;
+/// let chat_url = Endpoints::default().chat;
+/// let text = "so um i think its a little bit slow";
+/// let cleaned = clean_transcript(&client, &chat_url, "qwen3-coder-30b", text).await?;
 /// println!("{cleaned}"); // e.g. "I think it's a little bit slow."
 /// # Ok(())
 /// # }
 /// ```
-pub async fn clean_transcript(client: &Client, raw_text: &str) -> Result<String> {
+pub async fn clean_transcript(
+    client: &Client,
+    url: &str,
+    model: &str,
+    raw_text: &str,
+) -> Result<String> {
     let request = CleanTranscriptRequest {
-        model: "qwen3-coder-30b",
+        model,
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -208,7 +237,7 @@ pub async fn clean_transcript(client: &Client, raw_text: &str) -> Result<String>
     };
 
     let response = client
-        .post("http://127.0.0.1:8080/v1/chat/completions")
+        .post(url)
         .json(&request)
         .send()
         .await?
@@ -221,7 +250,7 @@ pub async fn clean_transcript(client: &Client, raw_text: &str) -> Result<String>
 /// Unit tests for the hallucination filter.
 #[cfg(test)]
 mod tests {
-    use super::is_hallucination;
+    use super::{Client, TranscribeOptions, clean_transcript, is_hallucination, transcribe_audio};
 
     /// Stock phrases, subtitle credits, dialogue markers, looping words and empty text, all
     /// typical Whisper output for noise or silence, must be flagged.
@@ -253,5 +282,59 @@ mod tests {
         ] {
             assert!(!is_hallucination(t), "should keep {t:?}");
         }
+    }
+
+    /// By default speech-to-text goes to the local server with the model called `whisper`.
+    #[test]
+    fn transcribe_defaults() {
+        let opts = TranscribeOptions::default();
+        assert_eq!(opts.url, "http://127.0.0.1:8080/v1/audio/transcriptions");
+        assert_eq!(opts.model, "whisper");
+        assert!(opts.language.is_none() && opts.prompt.is_none());
+    }
+
+    /// The configured URL and model name are what is actually sent.
+    #[tokio::test]
+    async fn transcription_uses_the_configured_url_and_model() {
+        let (base, request) =
+            crate::test_support::capture_once("application/json", r#"{"text":"hello there"}"#)
+                .await;
+        let opts = TranscribeOptions {
+            url: format!("{base}/custom/stt"),
+            model: "my-whisper-v3".into(),
+            language: Some("hr".into()),
+            ..TranscribeOptions::default()
+        };
+        let text = transcribe_audio(&Client::new(), b"RIFFfakewav", &opts)
+            .await
+            .unwrap();
+        assert_eq!(text, "hello there");
+        let sent = request.await.unwrap();
+        assert!(sent.starts_with("POST /custom/stt "), "{sent}");
+        assert!(sent.contains("my-whisper-v3"), "the model name is sent");
+        assert!(sent.contains("name=\"language\"") && sent.contains("hr"));
+        assert!(
+            !sent.contains("\r\n\r\nwhisper\r\n"),
+            "the default name is not sent"
+        );
+    }
+
+    /// Transcript cleaning goes to the configured chat URL with the configured model.
+    #[tokio::test]
+    async fn cleaning_uses_the_configured_url_and_model() {
+        let (base, request) = crate::test_support::capture_once(
+            "application/json",
+            r#"{"choices":[{"message":{"role":"assistant","content":"I think so."}}]}"#,
+        )
+        .await;
+        let url = format!("{base}/other/chat");
+        let cleaned = clean_transcript(&Client::new(), &url, "my-chat-model", "i think so")
+            .await
+            .unwrap();
+        assert_eq!(cleaned, "I think so.");
+        let sent = request.await.unwrap();
+        assert!(sent.starts_with("POST /other/chat "), "{sent}");
+        assert!(sent.contains("\"model\":\"my-chat-model\""), "{sent}");
+        assert!(sent.contains("i think so"));
     }
 }

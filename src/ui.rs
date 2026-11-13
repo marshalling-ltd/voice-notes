@@ -18,6 +18,7 @@
 use crate::audio::AudioRecorder;
 use crate::chat::{Conversation, ReplyDelta};
 use crate::config::Config;
+use crate::endpoints::Endpoints;
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
 use crate::setup::{self, Findings};
 use crate::speech::{SentenceSplitter, Speaker};
@@ -1019,6 +1020,9 @@ struct Session {
     conversation: Arc<Mutex<Conversation>>,
     reply_task: Option<JoinHandle<Result<String>>>,
     cleaning: Option<JoinHandle<Result<String>>>,
+    /// Where the services live, and the model that polishes transcripts.
+    endpoints: Endpoints,
+    clean_model: String,
     /// Pieces of the assistant's answer as they stream in.
     deltas_tx: UnboundedSender<ReplyDelta>,
     deltas_rx: UnboundedReceiver<ReplyDelta>,
@@ -1041,6 +1045,8 @@ impl Session {
         let opts = TranscribeOptions {
             language: settings.language.clone(),
             prompt: None,
+            url: settings.endpoints.stt.clone(),
+            model: settings.stt_model.clone(),
         };
         let (jobs, outcomes) = spawn_transcriber(client.clone(), opts);
         let (deltas_tx, deltas_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1053,6 +1059,8 @@ impl Session {
             conversation: Arc::new(Mutex::new(Self::conversation(settings))),
             reply_task: None,
             cleaning: None,
+            endpoints: settings.endpoints.clone(),
+            clean_model: settings.clean_model.clone(),
             deltas_tx,
             deltas_rx,
             splitter: SentenceSplitter::default(),
@@ -1066,7 +1074,9 @@ impl Session {
 
     /// A fresh conversation for the backend and prompt in `settings`.
     fn conversation(settings: &Settings) -> Conversation {
-        Conversation::new(settings.backend.clone()).with_prompt(settings.system_prompt.clone())
+        Conversation::new(settings.backend.clone())
+            .with_url(settings.endpoints.chat.clone())
+            .with_prompt(settings.system_prompt.clone())
     }
 
     /// Apply transcriptions that finished since the last tick.
@@ -1160,9 +1170,10 @@ impl Session {
     fn start_probe(&mut self, app: &mut App) {
         app.setup = Some(SetupState::Probing);
         let client = self.client.clone();
-        self.probe_task = Some(tokio::spawn(
-            async move { setup::probe(&client, false).await },
-        ));
+        let endpoints = self.endpoints.clone();
+        self.probe_task = Some(tokio::spawn(async move {
+            setup::probe(&client, &endpoints, false).await
+        }));
     }
 
     /// Save the recommended settings and start using them straight away.
@@ -1279,8 +1290,9 @@ impl Session {
             }
         } else if app.clean && !text.is_empty() {
             app.phase = Phase::Cleaning;
+            let (url, model) = (self.endpoints.chat.clone(), self.clean_model.clone());
             self.cleaning = Some(tokio::spawn(async move {
-                clean_transcript(&client, &text).await
+                clean_transcript(&client, &url, &model, &text).await
             }));
         } else {
             app.phase = Phase::Done;

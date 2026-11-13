@@ -6,12 +6,16 @@
 pub mod audio;
 pub mod chat;
 pub mod config;
+pub mod endpoints;
 pub mod hardware;
 pub mod latency;
 pub mod profile;
 pub mod setup;
 pub mod speech;
 pub mod transcribe;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {

@@ -71,6 +71,31 @@ prompt = "Answer in at most five words."
 description = "Very short answers"
 ```
 
+### Endpoints and the API contract
+
+The app talks to services over HTTP and speaks OpenAI-compatible requests only, so anything that answers the same requests can be swapped in: another machine, a container, a cloud service.
+
+| Job | Request | Default | Flag | Config key |
+| --- | --- | --- | --- | --- |
+| Speech to text | `POST /v1/audio/transcriptions` | `http://127.0.0.1:8080/v1/audio/transcriptions` | `--stt-url` | `stt_url` |
+| Chat (streaming) | `POST /v1/chat/completions` | `http://127.0.0.1:8080/v1/chat/completions` | `--chat-url` | `chat_url` |
+| Model list | `GET /v1/models` | `http://127.0.0.1:8080/v1/models` | `--models-url` | `models_url` |
+| Text to speech | `POST /v1/audio/speech` | `http://127.0.0.1:8880/v1/audio/speech` | `--tts-url` | `tts_url` |
+
+Every value is a full `http://` or `https://` URL, and anything else stops the program with a message naming the endpoint.
+
+For the usual case of one server hosting the first three, set it once: `--server http://gpu-box:8080` (config key `server`). It moves speech to text, chat and the model list together; text to speech is a separate service and keeps its own address.
+
+Model names are configurable too: `--stt-model` / `stt_model` (default `whisper`), `--tts-model` / `tts_model` (default `kokoro`), and the chat model through the profile (`--chat-model`, or `chat_model` in the config file, which also picks the model that polishes transcripts with `--clean`).
+
+Each setting is taken from the first place that has it: an individual flag, then `--server`, then the same key in the config file, then the config file's `server`, then the default. For example, with `server = "http://gpu-box:8080"` in the config file and `--chat-url http://other:8080/v1/chat/completions` on the command line, chat goes to `other` while speech to text and the model list go to `gpu-box`.
+
+```sh
+cargo run -- --server http://gpu-box:8080                       # one remote server
+cargo run -- --stt-url http://stt-box:9000/v1/audio/transcriptions --stt-model whisper-large-v3
+voice-notes setup --server http://gpu-box:8080                  # check that server instead
+```
+
 ### Privacy
 
 Voice Notes has no telemetry or analytics. It sends audio and text only to the endpoints you configure, which by default are on your own machine (`127.0.0.1`).

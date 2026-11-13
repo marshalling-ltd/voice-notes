@@ -1,6 +1,7 @@
 //! Shared plumbing between the interfaces: settings and the ordered transcription worker.
 
 use crate::chat::Backend;
+use crate::endpoints::Endpoints;
 use crate::speech::SpeechConfig;
 use crate::transcribe::{TranscribeOptions, is_hallucination, transcribe_audio};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -18,6 +19,12 @@ pub struct Settings {
     pub language: Option<String>,
     /// Print the live input level (plain mode only).
     pub verbose: bool,
+    /// Where the services live.
+    pub endpoints: Endpoints,
+    /// Model name sent to the speech-to-text endpoint.
+    pub stt_model: String,
+    /// Chat model used to polish the final transcript (`--clean`).
+    pub clean_model: String,
     /// Who answers in talk mode.
     pub backend: Backend,
     /// System prompt for the chat backend; `None` means the default spoken style.

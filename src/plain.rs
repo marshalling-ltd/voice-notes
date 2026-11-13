@@ -21,6 +21,8 @@ pub async fn run(settings: Settings) -> Result<()> {
     let opts = TranscribeOptions {
         language: settings.language.clone(),
         prompt: None,
+        url: settings.endpoints.stt.clone(),
+        model: settings.stt_model.clone(),
     };
     let (tx, mut rx) = spawn_transcriber(client.clone(), opts);
     let mut next_id = 0;
@@ -65,7 +67,13 @@ pub async fn run(settings: Settings) -> Result<()> {
 
     if settings.clean && !raw_transcript.is_empty() {
         println!("\nCleaning transcript...");
-        let cleaned = clean_transcript(&client, &raw_transcript).await?;
+        let cleaned = clean_transcript(
+            &client,
+            &settings.endpoints.chat,
+            &settings.clean_model,
+            &raw_transcript,
+        )
+        .await?;
         println!("\nCleaned transcript:");
         println!("{cleaned}");
     }
