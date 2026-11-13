@@ -172,6 +172,7 @@ pub struct AudioRecorder {
     threshold: Option<f32>,
     ambient: Vec<f32>,
     verbose: bool,
+    level: f32,
     skip_remaining: usize,
     stop_flag: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<f32>>>,
@@ -202,6 +203,7 @@ impl AudioRecorder {
             threshold: None,
             ambient: Vec::new(),
             verbose,
+            level: 0.0,
             skip_remaining: 0,
             stop_flag: Arc::new(AtomicBool::new(false)),
             samples: Arc::new(Mutex::new(Vec::new())),
@@ -277,6 +279,35 @@ impl AudioRecorder {
         Ok(out)
     }
 
+    /// RMS input level (0.0-1.0) of the audio received by the most recent poll.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use voice_notes::audio::AudioRecorder;
+    ///
+    /// let recorder = AudioRecorder::new(0.01, false);
+    /// assert!(recorder.level().abs() < f32::EPSILON); // nothing recorded yet
+    /// ```
+    #[must_use]
+    pub fn level(&self) -> f32 {
+        self.level
+    }
+
+    /// Whether speech is currently in progress (the gate has been crossed and no pause ended it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use voice_notes::audio::AudioRecorder;
+    ///
+    /// assert!(!AudioRecorder::new(0.01, false).is_speaking());
+    /// ```
+    #[must_use]
+    pub fn is_speaking(&self) -> bool {
+        self.segmenter.as_ref().is_some_and(|s| s.in_speech)
+    }
+
     /// The calibrated speech gate, or `None` while still measuring ambient noise.
     ///
     /// # Examples
@@ -341,8 +372,11 @@ impl AudioRecorder {
             bail!("not recording");
         }
         let new = self.drain()?;
+        if !new.is_empty() {
+            self.level = ac_rms(&new);
+        }
         if self.verbose && !new.is_empty() {
-            let level = ac_rms(&new);
+            let level = self.level;
             eprint!(
                 "\r[ac-level {level:.4} / gate {}]   ",
                 self.threshold
