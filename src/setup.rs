@@ -677,7 +677,7 @@ pub fn render(found: &Findings, plan: &Plan) -> String {
     if found.claude {
         let _ = writeln!(
             out,
-            "  [ok] {:<15} claude CLI available (use --backend claude)",
+            "  [ok] {:<15} claude CLI available (use --backend claude; what you say is then sent to Anthropic)",
             "Optional"
         );
     }

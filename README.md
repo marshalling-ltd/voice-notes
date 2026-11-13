@@ -71,6 +71,12 @@ prompt = "Answer in at most five words."
 description = "Very short answers"
 ```
 
+### Privacy
+
+Voice Notes has no telemetry or analytics. It sends audio and text only to the endpoints you configure, which by default are on your own machine (`127.0.0.1`).
+
+The one exception you can switch on is the **Claude backend** (the `claude` profile, or `--backend claude`): what you say is then sent to Anthropic, under Anthropic's terms, and billed to your account. While it is in use the Conversation panel says so on its border, and again before your first question. Local models never send anything off your machine.
+
 ### Setup
 
 `voice-notes setup` looks at your machine and what you already run, picks the best option for each job, and saves the choices after asking (`--yes` skips the question, `--check` only reports, `--quick` skips timing the models). In the full-screen interface the same screen opens on first launch, and again with `u`; `s` skips it while it is still working.

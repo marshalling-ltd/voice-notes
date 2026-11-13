@@ -41,6 +41,9 @@ const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
 const DIM: Color = Color::DarkGray;
 
+/// Shown whenever the Claude backend is in use: its replies come from Anthropic's servers.
+const CLOUD_NOTICE: &str = "what you say is sent to Anthropic";
+
 /// How many level samples the sparkline remembers.
 const HISTORY: usize = 240;
 /// Input level that fills the meter before the gate is known.
@@ -171,6 +174,8 @@ pub struct App {
     pub turns: Vec<Turn>,
     pub backend_label: String,
     pub speak_enabled: bool,
+    /// What you say is sent off this machine (the Claude backend); shown on screen.
+    pub cloud: bool,
     /// The setup screen, when it is open.
     pub setup: Option<SetupState>,
     /// The profile in use, and every profile `p` can switch to.
@@ -203,6 +208,7 @@ impl App {
             profile: String::new(),
             profiles: Vec::new(),
             speak_enabled: true,
+            cloud: false,
             next_id: 0,
             started: None,
         }
@@ -241,6 +247,13 @@ impl App {
         if let Some(turn) = self.turns.last_mut() {
             turn.reply = reply;
         }
+    }
+
+    /// Mark whether what you say is sent off this machine, so the screen can say so.
+    #[must_use]
+    pub fn with_cloud(mut self, cloud: bool) -> Self {
+        self.cloud = cloud;
+        self
     }
 
     /// Show which profile is in use and which others can be switched to.
@@ -475,9 +488,10 @@ impl App {
     }
 
     /// Update what the header shows after the settings changed.
-    pub fn reconfigure(&mut self, backend_label: String, speak_enabled: bool) {
+    pub fn reconfigure(&mut self, backend_label: String, speak_enabled: bool, cloud: bool) {
         self.backend_label = backend_label;
         self.speak_enabled = speak_enabled;
+        self.cloud = cloud;
     }
 
     fn scroll_up(&mut self, n: usize) {
@@ -818,20 +832,29 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn draw_conversation(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("Conversation");
+    let mut block = panel("Conversation");
+    if app.cloud {
+        block = block.title(Span::styled(
+            format!("· {CLOUD_NOTICE} "),
+            Style::new().fg(WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let lines = conversation_lines(app);
     if lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "Press Enter, ask your question, then press Enter again.",
-                Style::new().fg(DIM),
-            ))
-            .alignment(Alignment::Center),
-            inner,
-        );
+        let mut hint = vec![Line::from(Span::styled(
+            "Press Enter, ask your question, then press Enter again.",
+            Style::new().fg(DIM),
+        ))];
+        if app.cloud {
+            hint.push(Line::from(Span::styled(
+                format!("With this profile, {CLOUD_NOTICE}."),
+                Style::new().fg(WARN),
+            )));
+        }
+        frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), inner);
         return;
     }
     let lines = tail(lines, inner.width as usize, inner.height as usize);
@@ -1193,7 +1216,11 @@ impl Session {
         self.conversation = Arc::new(Mutex::new(Self::conversation(settings)));
         self.speaker.stop();
         self.speaker = Speaker::new(settings.speech.clone());
-        app.reconfigure(settings.backend.label(), settings.speak);
+        app.reconfigure(
+            settings.backend.label(),
+            settings.speak,
+            settings.backend.is_remote(),
+        );
         app.profile.clone_from(&settings.profile);
         app.profiles.clone_from(&settings.profiles);
     }
@@ -1375,6 +1402,7 @@ async fn event_loop(
     let mut session = Session::new(&settings, resolve, config);
     let mut app = App::new(settings.clean)
         .with_talk(settings.talk, settings.backend.label(), settings.speak)
+        .with_cloud(settings.backend.is_remote())
         .with_profiles(settings.profile.clone(), settings.profiles.clone());
     // First launch: no saved config yet, so offer to set things up.
     if Config::path().is_some_and(|path| !path.exists()) {
@@ -1963,7 +1991,7 @@ mod setup_tests {
     #[test]
     fn reconfigure_updates_header_state() {
         let mut app = App::new(false).with_talk(true, "old".into(), true);
-        app.reconfigure("qwen3-coder-30b".into(), false);
+        app.reconfigure("qwen3-coder-30b".into(), false, false);
         assert_eq!(app.backend_label, "qwen3-coder-30b");
         assert!(!app.speak_enabled);
         assert!(screen(&app).contains("qwen3-coder-30b") && screen(&app).contains("muted"));
@@ -2093,5 +2121,84 @@ mod profile_tests {
         let mut app = app_with_profiles("think");
         app.append_thinking("stray");
         assert!(app.turns.is_empty());
+    }
+}
+
+/// Tests for the notice that the Claude backend sends what you say to Anthropic.
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const NOTICE: &str = "what you say is sent to Anthropic";
+
+    fn screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn talk(cloud: bool) -> App {
+        App::new(false)
+            .with_talk(true, "claude".into(), true)
+            .with_cloud(cloud)
+    }
+
+    /// With the Claude backend the conversation panel says so on its border and, before the
+    /// first question, again in plain words.
+    #[test]
+    fn claude_shows_the_notice_twice_when_empty() {
+        let text = screen(&talk(true));
+        assert_eq!(text.matches(NOTICE).count(), 2, "{text}");
+        assert!(
+            text.contains(&format!("With this profile, {NOTICE}.")),
+            "{text}"
+        );
+    }
+
+    /// Once a conversation has started the border notice stays visible.
+    #[test]
+    fn notice_stays_during_a_conversation() {
+        let mut app = talk(true);
+        app.push_turn("hello".into());
+        app.set_reply(Reply::Text("Hi there.".into()));
+        let text = screen(&app);
+        assert!(
+            text.contains("Hi there.") && text.contains(NOTICE),
+            "{text}"
+        );
+    }
+
+    /// Local models keep everything on the machine, so nothing is said about Anthropic.
+    #[test]
+    fn local_models_show_no_notice() {
+        let text = screen(&talk(false));
+        assert!(!text.contains("Anthropic"), "{text}");
+    }
+
+    /// Notes mode never talks to the chat backend, so it shows no notice either.
+    #[test]
+    fn notes_mode_shows_no_notice() {
+        let text = screen(&App::new(false).with_cloud(true));
+        assert!(!text.contains("Anthropic"), "{text}");
+    }
+
+    /// Switching profile updates the notice: it appears for Claude and disappears for a local
+    /// model.
+    #[test]
+    fn switching_backend_updates_the_notice() {
+        let mut app = talk(false);
+        assert!(!screen(&app).contains(NOTICE));
+        app.reconfigure("claude".into(), true, true);
+        assert!(screen(&app).contains(NOTICE));
+        app.reconfigure("qwen3-coder-30b".into(), true, false);
+        assert!(!screen(&app).contains(NOTICE));
     }
 }

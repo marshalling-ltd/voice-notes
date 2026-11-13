@@ -63,6 +63,22 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// True if what you say leaves this machine: the Claude backend sends transcripts to
+    /// Anthropic, while local models keep everything on this machine.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use voice_notes::chat::Backend;
+    ///
+    /// assert!(Backend::Claude.is_remote());
+    /// assert!(!Backend::Local { model: "qwen3-coder-30b".into(), think: false }.is_remote());
+    /// ```
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Claude)
+    }
+
     /// Short name for the screen.
     #[must_use]
     pub fn label(&self) -> String {
@@ -473,6 +489,7 @@ mod tests {
     #[test]
     fn backend_labels() {
         assert_eq!(Backend::Claude.label(), "claude");
+        assert!(Backend::Claude.is_remote());
         assert_eq!(
             Backend::Local {
                 model: "qwen-reasoner".into(),
