@@ -1,24 +1,63 @@
-.PHONY: check format test clean
+.PHONY: code check nextest test nextest-cov test-cov clean upgrade requirements
 
-check:
-	cargo check
+# --- Developer targets (require extra tools; see `make requirements`) ---
 
-format:
-	cargo fmt
+code:
+	@echo "voice-notes: code check\n"
+	@rustup update
+	@rustup run nightly cargo update
+	@rustup run nightly cargo upgrade
+	@rustup run nightly cargo machete
+	@rustup run nightly cargo audit
+	@rustup run nightly cargo deny --log-level error check
+	@typos
+	@rustup run nightly cargo fmt
+	@rustup run nightly cargo fix --allow-dirty --allow-no-vcs --allow-staged
+	@rustup run nightly cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features -- -W clippy::pedantic
+	@rustup run nightly cargo clippy --all-targets --all-features -- -W clippy::pedantic
+	@rustup run nightly cargo test --doc
 
-clippy:
-	cargo clippy --all-targets --all-features -- -D warnings
+# Mandatory before every push; CI runs the same checks on pull requests.
+check: code nextest
 
-fix:
-	cargo fix --allow-dirty --allow-staged
+# --- Test targets ---
+
+nextest:
+	@echo "voice-notes: test (nextest)\n"
+	@rustup run nightly cargo nextest run
 
 test:
-	cargo test
+	@echo "voice-notes: test\n"
+	@rustup run nightly cargo test
 
-build:
-	cargo build
+# --- Code coverage ---
+
+nextest-cov:
+	@echo "voice-notes: code coverage (nextest)\n"
+	@rustup run nightly cargo llvm-cov --open nextest
+
+test-cov:
+	@echo "voice-notes: code coverage\n"
+	@rustup run nightly cargo llvm-cov --open
+
+# --- Misc ---
 
 clean:
 	cargo clean
 
-lint: clippy format
+upgrade:
+	@cargo upgrade --verbose
+
+requirements:
+	@echo "voice-notes: requirements\n"
+	@rustup update
+	@rustup install nightly
+	@rustup component add rustfmt clippy llvm-tools-preview --toolchain nightly
+	@cargo install cargo-audit
+	@cargo install cargo-deny
+	@cargo install cargo-edit
+	@cargo install cargo-llvm-cov
+	@cargo install cargo-machete
+	@cargo install cargo-nextest --locked
+	@cargo install typos-cli
+	@echo "System packages (Debian/Ubuntu): sudo apt-get install -y libasound2-dev pkg-config build-essential"

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Lint: format check + clippy pedantic + doc tests
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+          rustup component add rustfmt clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libasound2-dev pkg-config build-essential
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (pedantic)
+        run: cargo clippy --all-targets --all-features -- -W clippy::pedantic -D warnings
+
+      - name: cargo test --doc
+        run: cargo test --doc
+
+  # Supply chain: advisories, licenses, unused dependencies, typos
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tools
+        run: cargo install cargo-audit cargo-deny cargo-machete typos-cli --locked
+
+      - run: cargo machete
+      - run: cargo audit
+      - run: cargo deny --log-level error check
+      - run: typos
+
+  # Test: cargo nextest
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libasound2-dev pkg-config build-essential
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      - name: cargo nextest run
+        run: cargo nextest run

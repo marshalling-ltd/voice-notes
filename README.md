@@ -1,68 +1,46 @@
-# Voice Notes - Speech-to-Text CLI
+# Voice Notes
 
-A Rust command-line application for speech-to-text transcription with optional text cleaning capabilities.
+Speech-to-text CLI. Press Enter, talk, and text appears after each pause while you are still recording. Optionally cleans the final transcript (grammar, punctuation, capitalization).
 
-## Features
+## How it works
 
-- Capture audio from microphone using ALSA
-- Transcribe audio to text using a transcription service
-- Clean and improve text quality (grammar, punctuation, capitalization)
-- Command-line interface with `--clean` flag
-
-## Requirements
-
-- Rust 1.70+
-- ALSA development libraries (for audio capture)
-
-## Installation
-
-```bash
-cargo build --release
-```
+- Records from the default microphone with `cpal` (PulseAudio host, served by PipeWire or PulseAudio; falls back to the ALSA default).
+- Measures about one second of background noise at the start and sets a speech gate from it, so it adapts to noisy or hot microphones.
+- Cuts an utterance after a pause and transcribes it against a local Whisper-compatible server (`http://127.0.0.1:8080/v1/audio/transcriptions`) while recording continues.
+- Drops weak segments and likely Whisper hallucinations (stock phrases, subtitle credits, looping text).
+- With `--clean`, the combined transcript is polished through `/v1/chat/completions` on the same server.
 
 ## Usage
 
-### Basic transcription:
-```bash
-cargo run
+```sh
+cargo run                       # live transcription
+cargo run -- --clean            # also clean up the final transcript
+cargo run -- --language hr      # spoken language (default en, `auto` to detect)
+cargo run -- --verbose          # show the live input level and calibrated gate
+cargo run -- --threshold 0.02   # minimum speech level (default 0.01)
 ```
 
-### With text cleaning:
-```bash
-cargo run -- --clean
-```
+If text lags or nothing appears, run with `--verbose` and compare the `ac-level` while speaking with the gate. If a quiet room reads very high, lower the microphone gain, for example `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.3`.
 
-## Architecture
+## Project layout
 
-The application is organized into three modules:
+| File | Purpose |
+| --- | --- |
+| `src/audio.rs` | Microphone capture, noise calibration, silence-based segmentation, WAV encoding |
+| `src/transcribe.rs` | Whisper and chat HTTP calls, hallucination filter |
+| `src/main.rs` | CLI, live loop, ordered transcription worker |
 
-1. **`src/audio.rs`** - Audio recording using ALSA
-2. **`src/transcribe.rs`** - Text transcription and cleaning via HTTP APIs
-3. **`src/main.rs`** - CLI interface and integration
+## Contributing
 
-## Build Commands
+1. Fork `marshalling-ltd/voice-notes` and clone your fork (`origin`); add the org repo as `upstream`.
+2. One-time setup (Rust nightly, cargo tools and the ALSA headers):
 
-The project includes a Makefile with useful commands:
+   ```sh
+   make requirements   # needs: sudo apt-get install -y libasound2-dev pkg-config build-essential
+   cargo run           # start the app
+   make check          # cargo update/upgrade, machete, audit, deny, typos, fmt, clippy pedantic, tests
+   ```
 
-- `make check` - Run cargo check
-- `make format` - Format code with rustfmt
-- `make clippy` - Run clippy with pedantic warnings  
-- `make fix` - Automatically fix common issues
-- `make test` - Run tests
-- `make build` - Build the project
-- `make clean` - Clean build artifacts
-- `make lint` - Run both clippy and format checks
+3. Branch off `upstream/master`, make a focused change with tests, **run `make check` before every push**, push to your fork and open a pull request against `master`. CI runs the same checks and must pass.
 
-## Dependencies
-
-- `alsa = "0.7"` - Audio capture
-- `hound = "3.5"` - WAV file encoding
-- `reqwest = { version = "0.13", features = ["multipart", "json"] }` - HTTP client
-- `tokio = { version = "1", features = ["full"] }` - Async runtime
-- `anyhow = "1"` - Error handling
-- `serde = { version = "1", features = ["derive"] }` - Serialization
-- `clap = "4"` - Command-line parsing
-
-## Note
-
-This implementation follows the exact specifications requested, including using ALSA for audio capture instead of cpal due to environment limitations. The code is fully functional and would work correctly in an environment with proper ALSA support.
+Other targets: `make test`, `make nextest`, `make test-cov`, `make clean`.

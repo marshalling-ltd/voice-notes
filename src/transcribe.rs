@@ -55,6 +55,7 @@ const STOCK_PHRASES: &[&str] = &[
 ];
 
 /// Heuristics for text Whisper typically makes up from noise or near-silence.
+#[must_use]
 pub fn is_hallucination(text: &str) -> bool {
     let lower = text.trim().to_lowercase();
     let bare: String = lower
@@ -131,7 +132,7 @@ pub async fn clean_transcript(client: &Client, raw_text: &str) -> Result<String>
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: format!("Please improve the following text: {}", raw_text),
+                content: format!("Please improve the following text: {raw_text}"),
             },
         ],
     };

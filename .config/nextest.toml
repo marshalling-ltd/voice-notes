@@ -1,0 +1,4 @@
+[profile.default]
+# Background tokio runtime threads may briefly outlive individual test processes;
+# increase the leak threshold so nextest doesn't flag it.
+leak-timeout = "2s"

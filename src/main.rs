@@ -8,7 +8,7 @@ mod audio;
 mod transcribe;
 
 use audio::AudioRecorder;
-use transcribe::{clean_transcript, is_hallucination, transcribe_audio, TranscribeOptions};
+use transcribe::{TranscribeOptions, clean_transcript, is_hallucination, transcribe_audio};
 
 #[derive(Parser)]
 struct Args {
@@ -87,12 +87,11 @@ async fn main() -> Result<()> {
                 for wav in recorder.poll_segments()? {
                     let _ = tx.send(wav);
                 }
-                if !announced {
-                    if let Some(gate) = recorder.calibrated_threshold() {
+                if !announced
+                    && let Some(gate) = recorder.calibrated_threshold() {
                         announced = true;
                         println!("\nReady (speech gate {gate:.3}). Speak; text appears after each pause. Press Enter to stop.\n");
                     }
-                }
             }
         }
     }
