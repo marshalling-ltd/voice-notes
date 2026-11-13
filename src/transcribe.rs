@@ -1,3 +1,4 @@
+use crate::chat::ChatMessage;
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -5,12 +6,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize)]
 struct TranscriptionResponse {
     text: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
 }
 
 #[derive(Serialize)]

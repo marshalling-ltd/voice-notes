@@ -1,9 +1,11 @@
 //! Voice Notes - Speech-to-Text CLI Application
 //!
-//! This crate provides a command-line interface for speech-to-text conversion
-//! with optional text cleaning capabilities.
+//! This crate provides speech-to-text transcription with optional text cleaning, and a voice
+//! conversation loop: your speech is transcribed, answered by a chat backend, and spoken back.
 
 pub mod audio;
+pub mod chat;
+pub mod speech;
 pub mod transcribe;
 
 #[cfg(test)]

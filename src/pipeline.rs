@@ -1,9 +1,12 @@
 //! Shared plumbing between the interfaces: settings and the ordered transcription worker.
 
+use crate::chat::Backend;
 use crate::transcribe::{TranscribeOptions, is_hallucination, transcribe_audio};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Options chosen on the command line.
+// Each bool is an independent command-line switch, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct Settings {
     /// Polish the final transcript with the chat model.
@@ -14,6 +17,14 @@ pub struct Settings {
     pub language: Option<String>,
     /// Print the live input level (plain mode only).
     pub verbose: bool,
+    /// Who answers in talk mode.
+    pub backend: Backend,
+    /// Speak replies aloud.
+    pub speak: bool,
+    /// `espeak-ng` voice.
+    pub voice: String,
+    /// Start in talk mode instead of notes mode.
+    pub talk: bool,
 }
 
 /// One utterance waiting to be transcribed.

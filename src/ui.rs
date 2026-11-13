@@ -16,7 +16,9 @@
 //! ```
 
 use crate::audio::AudioRecorder;
+use crate::chat::Conversation;
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
+use crate::speech::Speaker;
 use crate::transcribe::{TranscribeOptions, clean_transcript};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -25,7 +27,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Sparkline, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 const ACCENT: Color = Color::Cyan;
@@ -52,8 +57,36 @@ pub enum Phase {
     Finishing,
     /// Waiting for the chat model to polish the transcript.
     Cleaning,
-    /// Everything finished.
+    /// Waiting for the assistant to answer (talk mode).
+    Thinking,
+    /// The reply (or the notes) is being read aloud.
+    Speaking,
+    /// Everything finished; ready for the next turn.
     Done,
+}
+
+/// What the app is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Dictate notes.
+    Notes,
+    /// Hold a spoken conversation with the assistant.
+    Talk,
+}
+
+/// The assistant's answer to one turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reply {
+    Pending,
+    Text(String),
+    Failed(String),
+}
+
+/// One question and answer in talk mode.
+#[derive(Clone, Debug)]
+pub struct Turn {
+    pub user: String,
+    pub reply: Reply,
 }
 
 /// What a transcribed utterance looks like on screen.
@@ -78,9 +111,17 @@ pub struct Entry {
 pub enum Action {
     Start,
     Stop,
+    /// Cut off speech that is playing.
+    Skip,
+    /// Read the notes (or the last reply) aloud.
+    ReadAloud,
+    /// Forget the conversation so far.
+    NewConversation,
 }
 
 /// Everything the screen shows.
+// The bools are independent facts (speaking, clean, quit, speech on), not one state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub phase: Phase,
     pub entries: Vec<Entry>,
@@ -94,6 +135,10 @@ pub struct App {
     pub scroll: usize,
     pub elapsed: Duration,
     pub quit: bool,
+    pub mode: Mode,
+    pub turns: Vec<Turn>,
+    pub backend_label: String,
+    pub speak_enabled: bool,
     next_id: usize,
     started: Option<Instant>,
 }
@@ -114,8 +159,58 @@ impl App {
             scroll: 0,
             elapsed: Duration::ZERO,
             quit: false,
+            mode: Mode::Notes,
+            turns: Vec::new(),
+            backend_label: String::new(),
+            speak_enabled: true,
             next_id: 0,
             started: None,
+        }
+    }
+
+    /// Configure talk mode: start in it if `talk`, show `backend_label`, and speak replies if
+    /// `speak_enabled`.
+    #[must_use]
+    pub fn with_talk(mut self, talk: bool, backend_label: String, speak_enabled: bool) -> Self {
+        if talk {
+            self.mode = Mode::Talk;
+        }
+        self.backend_label = backend_label;
+        self.speak_enabled = speak_enabled;
+        self
+    }
+
+    /// Nothing is happening, so the user may start, switch mode or read aloud.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        matches!(self.phase, Phase::Idle | Phase::Done)
+    }
+
+    /// Add the user's words as a new turn awaiting an answer.
+    pub fn push_turn(&mut self, user: String) {
+        self.turns.push(Turn {
+            user,
+            reply: Reply::Pending,
+        });
+        self.scroll = 0;
+    }
+
+    /// Record the assistant's answer to the latest turn.
+    pub fn set_reply(&mut self, reply: Reply) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.reply = reply;
+        }
+    }
+
+    /// Text that `r` reads aloud: the notes, or the assistant's latest answer.
+    #[must_use]
+    pub fn readable(&self) -> Option<String> {
+        match self.mode {
+            Mode::Notes => Some(self.final_text()).filter(|t| !t.is_empty()),
+            Mode::Talk => self.turns.iter().rev().find_map(|t| match &t.reply {
+                Reply::Text(text) => Some(text.clone()),
+                _ => None,
+            }),
         }
     }
 
@@ -231,8 +326,24 @@ impl App {
                 return match self.phase {
                     Phase::Idle | Phase::Done => Some(Action::Start),
                     Phase::Calibrating | Phase::Listening => Some(Action::Stop),
-                    Phase::Finishing | Phase::Cleaning => None,
+                    Phase::Speaking => Some(Action::Skip),
+                    Phase::Finishing | Phase::Cleaning | Phase::Thinking => None,
                 };
+            }
+            KeyCode::Char('t') if self.idle() => {
+                self.mode = match self.mode {
+                    Mode::Notes => Mode::Talk,
+                    Mode::Talk => Mode::Notes,
+                };
+                self.scroll = 0;
+            }
+            KeyCode::Char('r') if self.idle() => {
+                return self.readable().map(|_| Action::ReadAloud);
+            }
+            KeyCode::Char('n') if self.idle() && self.mode == Mode::Talk => {
+                self.turns.clear();
+                self.scroll = 0;
+                return Some(Action::NewConversation);
             }
             KeyCode::Char('c') => self.clean = !self.clean,
             KeyCode::Up | KeyCode::Char('k') => self.scroll_up(1),
@@ -245,7 +356,11 @@ impl App {
     }
 
     fn scroll_up(&mut self, n: usize) {
-        self.scroll = (self.scroll + n).min(self.entries.len().saturating_sub(1));
+        let items = match self.mode {
+            Mode::Notes => self.entries.len(),
+            Mode::Talk => self.turns.len(),
+        };
+        self.scroll = (self.scroll + n).min(items.saturating_sub(1));
     }
 
     fn scroll_down(&mut self, n: usize) {
@@ -314,6 +429,8 @@ fn status(app: &App) -> (&'static str, Color) {
         Phase::Listening => ("● LISTENING", GOOD),
         Phase::Finishing => ("◌ TRANSCRIBING", WARN),
         Phase::Cleaning => ("◌ CLEANING", WARN),
+        Phase::Thinking => ("◌ THINKING", WARN),
+        Phase::Speaking => ("♪ SPEAKING", ACCENT),
         Phase::Done => ("✔ DONE", ACCENT),
     }
 }
@@ -337,14 +454,28 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
-    let clean = if app.clean { "on" } else { "off" };
-    let clean_color = if app.clean { GOOD } else { DIM };
+    let right = match app.mode {
+        Mode::Notes => {
+            let clean = if app.clean { "on" } else { "off" };
+            let clean_color = if app.clean { GOOD } else { DIM };
+            vec![
+                Span::styled("notes · clean: ", Style::new().fg(DIM)),
+                Span::styled(clean, Style::new().fg(clean_color)),
+            ]
+        }
+        Mode::Talk => {
+            let mut spans = vec![
+                Span::styled("talk · ", Style::new().fg(DIM)),
+                Span::styled(app.backend_label.clone(), Style::new().fg(ACCENT)),
+            ];
+            if !app.speak_enabled {
+                spans.push(Span::styled(" · muted", Style::new().fg(DIM)));
+            }
+            spans
+        }
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("clean: ", Style::new().fg(DIM)),
-            Span::styled(clean, Style::new().fg(clean_color)),
-        ]))
-        .alignment(Alignment::Right),
+        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
         inner,
     );
 }
@@ -394,7 +525,9 @@ fn level_bar(app: &App, width: usize) -> Line<'static> {
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
-    if let Some(cleaned) = &app.cleaned {
+    if app.mode == Mode::Talk {
+        draw_conversation(frame, area, app);
+    } else if let Some(cleaned) = &app.cleaned {
         let [raw, polished] =
             Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
         draw_transcript(frame, raw, app);
@@ -465,12 +598,20 @@ fn visible_lines(
     height: usize,
     scroll: usize,
 ) -> Vec<Line<'static>> {
-    let width = width.max(1);
     let end = entries.len().saturating_sub(scroll);
+    tail(
+        entries[..end].iter().map(entry_line).collect(),
+        width,
+        height,
+    )
+}
+
+/// Keep the newest `lines` that fit in `height` rows once wrapped to `width`.
+fn tail(lines: Vec<Line<'static>>, width: usize, height: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
     let mut used = 0;
     let mut picked: Vec<Line<'static>> = Vec::new();
-    for entry in entries[..end].iter().rev() {
-        let line = entry_line(entry);
+    for line in lines.into_iter().rev() {
         let rows = line.width().div_ceil(width).max(1);
         if used + rows > height && !picked.is_empty() {
             break;
@@ -482,25 +623,104 @@ fn visible_lines(
     picked
 }
 
+/// The talk-mode lines: each turn's question and answer, then the question being spoken now.
+fn conversation_lines(app: &App) -> Vec<Line<'static>> {
+    let who = |name: &'static str, color: Color| {
+        Span::styled(name, Style::new().fg(color).add_modifier(Modifier::BOLD))
+    };
+    let end = app.turns.len().saturating_sub(app.scroll);
+    let mut lines = Vec::new();
+    for turn in &app.turns[..end] {
+        lines.push(Line::from(vec![
+            who("you ", ACCENT),
+            Span::raw(turn.user.clone()),
+        ]));
+        let answer = match &turn.reply {
+            Reply::Pending => Span::styled(
+                "… thinking",
+                Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
+            ),
+            Reply::Text(t) => Span::raw(t.clone()),
+            Reply::Failed(e) => Span::styled(format!("✗ {e}"), Style::new().fg(BAD)),
+        };
+        lines.push(Line::from(vec![who("ai  ", GOOD), answer]));
+        lines.push(Line::default());
+    }
+    if app.scroll == 0
+        && matches!(
+            app.phase,
+            Phase::Calibrating | Phase::Listening | Phase::Finishing
+        )
+    {
+        let live = app.transcript();
+        let words = if live.is_empty() {
+            Span::styled("…", Style::new().fg(DIM))
+        } else {
+            Span::raw(live)
+        };
+        lines.push(Line::from(vec![who("you ", ACCENT), words]));
+    }
+    lines
+}
+
+fn draw_conversation(frame: &mut Frame, area: Rect, app: &App) {
+    let block = panel("Conversation");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = conversation_lines(app);
+    if lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Press Enter, ask your question, then press Enter again.",
+                Style::new().fg(DIM),
+            ))
+            .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+    let lines = tail(lines, inner.width as usize, inner.height as usize);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let key =
         |k: &'static str| Span::styled(k, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
     let text = |t: &'static str| Span::styled(t, Style::new().fg(DIM));
-    let action = if app.recording() { " stop" } else { " start" };
-    let mut spans = vec![
-        Span::raw(" "),
-        key("Enter"),
-        text(action),
-        text("  ·  "),
-        key("c"),
-        text(" clean"),
-        text("  ·  "),
+    let action = match app.phase {
+        Phase::Calibrating | Phase::Listening => " stop",
+        Phase::Speaking => " skip",
+        Phase::Finishing | Phase::Cleaning | Phase::Thinking => " wait",
+        Phase::Idle | Phase::Done => " start",
+    };
+    let sep = || text("  ·  ");
+    let mut spans = vec![Span::raw(" "), key("Enter"), text(action)];
+    if app.idle() {
+        spans.extend([
+            sep(),
+            key("t"),
+            text(if app.mode == Mode::Talk {
+                " notes"
+            } else {
+                " talk"
+            }),
+        ]);
+        spans.extend([sep(), key("r"), text(" read")]);
+    }
+    if app.mode == Mode::Talk {
+        spans.extend([sep(), key("n"), text(" new")]);
+    } else {
+        spans.extend([sep(), key("c"), text(" clean")]);
+    }
+    spans.extend([
+        sep(),
         key("↑↓"),
         text(" scroll"),
-        text("  ·  "),
+        sep(),
         key("q"),
         text(" quit"),
-    ];
+    ]);
     if let Some(notice) = &app.notice {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(notice.clone(), Style::new().fg(BAD)));
@@ -520,82 +740,161 @@ pub async fn run(settings: Settings) -> Result<String> {
     result
 }
 
-async fn event_loop(terminal: &mut DefaultTerminal, settings: Settings) -> Result<String> {
-    let mut recorder = AudioRecorder::new(settings.min_threshold, false);
-    let client = reqwest::Client::new();
-    let opts = TranscribeOptions {
-        language: settings.language.clone(),
-        prompt: None,
-    };
-    let (tx, mut rx) = spawn_transcriber(client.clone(), opts);
-    let mut app = App::new(settings.clean);
-    let mut cleaning: Option<JoinHandle<Result<String>>> = None;
-    let mut tick = tokio::time::interval(Duration::from_millis(50));
+/// Everything the event loop drives besides the screen state.
+struct Session {
+    recorder: AudioRecorder,
+    speaker: Speaker,
+    client: reqwest::Client,
+    jobs: UnboundedSender<Job>,
+    outcomes: UnboundedReceiver<Outcome>,
+    conversation: Arc<Mutex<Conversation>>,
+    reply_task: Option<JoinHandle<Result<String>>>,
+    cleaning: Option<JoinHandle<Result<String>>>,
+}
 
-    while !app.quit {
-        terminal.draw(|frame| draw(frame, &app))?;
-        tick.tick().await;
+impl Session {
+    fn new(settings: &Settings) -> Self {
+        let client = reqwest::Client::new();
+        let opts = TranscribeOptions {
+            language: settings.language.clone(),
+            prompt: None,
+        };
+        let (jobs, outcomes) = spawn_transcriber(client.clone(), opts);
+        Self {
+            recorder: AudioRecorder::new(settings.min_threshold, false),
+            speaker: Speaker::new(settings.voice.clone()),
+            client,
+            jobs,
+            outcomes,
+            conversation: Arc::new(Mutex::new(Conversation::new(settings.backend.clone()))),
+            reply_task: None,
+            cleaning: None,
+        }
+    }
 
-        while let Ok(outcome) = rx.try_recv() {
+    /// Apply transcriptions that finished since the last tick.
+    fn collect_outcomes(&mut self, app: &mut App) {
+        while let Ok(outcome) = self.outcomes.try_recv() {
             app.on_outcome(outcome);
         }
+    }
 
-        if app.recording() {
-            match recorder.poll_segments() {
-                Ok(segments) => {
-                    for wav in segments {
-                        let id = app.queue();
-                        let _ = tx.send(Job { id, wav });
-                    }
-                    app.on_tick(
-                        recorder.level(),
-                        recorder.calibrated_threshold(),
-                        recorder.is_speaking(),
-                    );
+    /// Queue finished utterances and refresh the meter while the microphone is open.
+    fn poll_recording(&mut self, app: &mut App) {
+        if !app.recording() {
+            return;
+        }
+        match self.recorder.poll_segments() {
+            Ok(segments) => {
+                for wav in segments {
+                    let id = app.queue();
+                    let _ = self.jobs.send(Job { id, wav });
                 }
-                Err(e) => {
-                    app.notice = Some(format!("recording failed: {e:#}"));
-                    let _ = recorder.stop_recording();
-                    app.phase = Phase::Idle;
-                }
+                app.on_tick(
+                    self.recorder.level(),
+                    self.recorder.calibrated_threshold(),
+                    self.recorder.is_speaking(),
+                );
+            }
+            Err(e) => {
+                app.notice = Some(format!("recording failed: {e:#}"));
+                let _ = self.recorder.stop_recording();
+                app.phase = Phase::Idle;
             }
         }
+    }
 
+    /// Read pending key presses and carry out what they ask for.
+    async fn handle_keys(&mut self, app: &mut App) -> Result<()> {
         while event::poll(Duration::ZERO)? {
             let Event::Key(key) = event::read()? else {
                 continue;
             };
-            match app.on_key(key) {
-                Some(Action::Start) => match recorder.start_recording() {
-                    Ok(()) => app.begin(),
-                    Err(e) => app.notice = Some(format!("cannot start: {e:#}")),
-                },
-                Some(Action::Stop) => {
-                    stop_and_queue(&mut recorder, &mut app, &tx);
-                }
-                None => {}
+            if let Some(action) = app.on_key(key) {
+                self.act(app, action).await;
             }
         }
+        Ok(())
+    }
 
-        if app.quit && app.recording() {
-            let _ = recorder.stop_recording();
+    async fn act(&mut self, app: &mut App, action: Action) {
+        match action {
+            Action::Start => match self.recorder.start_recording() {
+                Ok(()) => app.begin(),
+                Err(e) => app.notice = Some(format!("cannot start: {e:#}")),
+            },
+            Action::Stop => self.stop_recording(app),
+            Action::Skip => {
+                self.speaker.stop();
+                app.phase = Phase::Done;
+            }
+            Action::ReadAloud => {
+                if let Some(text) = app.readable() {
+                    self.speak(app, &text);
+                }
+            }
+            Action::NewConversation => self.conversation.lock().await.reset(),
         }
+    }
 
-        if app.phase == Phase::Finishing && app.pending() == 0 {
-            let text = app.transcript();
-            if app.clean && !text.is_empty() {
-                app.phase = Phase::Cleaning;
-                let client = client.clone();
-                cleaning = Some(tokio::spawn(async move {
-                    clean_transcript(&client, &text).await
-                }));
-            } else {
+    /// Stop the recorder and send any trailing utterance to the transcriber.
+    fn stop_recording(&mut self, app: &mut App) {
+        match self.recorder.stop_recording() {
+            Ok(Some(wav)) => {
+                let id = app.queue();
+                let _ = self.jobs.send(Job { id, wav });
+            }
+            Ok(None) => {}
+            Err(e) => app.notice = Some(format!("stop failed: {e:#}")),
+        }
+        app.stopped();
+    }
+
+    /// Start reading `text` aloud, or report why that is not possible.
+    fn speak(&mut self, app: &mut App, text: &str) {
+        match self.speaker.speak(text) {
+            Ok(()) if self.speaker.is_speaking() => app.phase = Phase::Speaking,
+            Ok(()) => app.phase = Phase::Done,
+            Err(e) => {
+                app.notice = Some(format!("{e:#}"));
                 app.phase = Phase::Done;
             }
         }
+    }
 
-        if cleaning.as_ref().is_some_and(JoinHandle::is_finished)
-            && let Some(handle) = cleaning.take()
+    /// Once every utterance is transcribed, ask the assistant (talk) or clean the notes.
+    fn advance(&mut self, app: &mut App) {
+        if app.phase != Phase::Finishing || app.pending() != 0 {
+            return;
+        }
+        let text = app.transcript();
+        let client = self.client.clone();
+        if app.mode == Mode::Talk {
+            if text.is_empty() {
+                app.notice = Some("didn't catch anything, try again".to_string());
+                app.phase = Phase::Done;
+            } else {
+                app.push_turn(text.clone());
+                app.phase = Phase::Thinking;
+                let conversation = Arc::clone(&self.conversation);
+                self.reply_task = Some(tokio::spawn(async move {
+                    conversation.lock().await.reply(&client, &text).await
+                }));
+            }
+        } else if app.clean && !text.is_empty() {
+            app.phase = Phase::Cleaning;
+            self.cleaning = Some(tokio::spawn(async move {
+                clean_transcript(&client, &text).await
+            }));
+        } else {
+            app.phase = Phase::Done;
+        }
+    }
+
+    /// Pick up the cleaned text or the assistant's answer once their tasks finish.
+    async fn finish_tasks(&mut self, app: &mut App) {
+        if self.cleaning.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.cleaning.take()
         {
             match handle.await {
                 Ok(Ok(text)) => app.cleaned = Some(text),
@@ -604,25 +903,59 @@ async fn event_loop(terminal: &mut DefaultTerminal, settings: Settings) -> Resul
             }
             app.phase = Phase::Done;
         }
+
+        if self
+            .reply_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.reply_task.take()
+        {
+            match handle.await {
+                Ok(Ok(reply)) => {
+                    app.set_reply(Reply::Text(reply.clone()));
+                    if app.speak_enabled {
+                        self.speak(app, &reply);
+                    } else {
+                        app.phase = Phase::Done;
+                    }
+                }
+                Ok(Err(e)) => {
+                    app.set_reply(Reply::Failed(format!("{e:#}")));
+                    app.phase = Phase::Done;
+                }
+                Err(e) => {
+                    app.set_reply(Reply::Failed(e.to_string()));
+                    app.phase = Phase::Done;
+                }
+            }
+        }
+
+        if app.phase == Phase::Speaking && !self.speaker.is_speaking() {
+            app.phase = Phase::Done;
+        }
     }
-    Ok(app.final_text())
 }
 
-/// Stop the recorder and send any trailing utterance to the transcriber.
-fn stop_and_queue(
-    recorder: &mut AudioRecorder,
-    app: &mut App,
-    tx: &tokio::sync::mpsc::UnboundedSender<Job>,
-) {
-    match recorder.stop_recording() {
-        Ok(Some(wav)) => {
-            let id = app.queue();
-            let _ = tx.send(Job { id, wav });
+async fn event_loop(terminal: &mut DefaultTerminal, settings: Settings) -> Result<String> {
+    let mut session = Session::new(&settings);
+    let mut app =
+        App::new(settings.clean).with_talk(settings.talk, settings.backend.label(), settings.speak);
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+
+    while !app.quit {
+        terminal.draw(|frame| draw(frame, &app))?;
+        tick.tick().await;
+
+        session.collect_outcomes(&mut app);
+        session.poll_recording(&mut app);
+        session.handle_keys(&mut app).await?;
+        if app.quit && app.recording() {
+            let _ = session.recorder.stop_recording();
         }
-        Ok(None) => {}
-        Err(e) => app.notice = Some(format!("stop failed: {e:#}")),
+        session.advance(&mut app);
+        session.finish_tasks(&mut app).await;
     }
-    app.stopped();
+    Ok(app.final_text())
 }
 
 #[cfg(test)]
@@ -834,5 +1167,153 @@ mod tests {
                 && text.contains("Cleaned")
                 && text.contains("I think it's slow.")
         );
+    }
+}
+
+/// Tests for talk mode.
+#[cfg(test)]
+mod talk_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn talk_app() -> App {
+        App::new(false).with_talk(true, "qwen-reasoner".to_string(), true)
+    }
+
+    fn screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// `t` switches between notes and talk, but only while idle.
+    #[test]
+    fn t_toggles_mode_only_when_idle() {
+        let mut app = App::new(false);
+        app.on_key(press(KeyCode::Char('t')));
+        assert_eq!(app.mode, Mode::Talk);
+        app.on_key(press(KeyCode::Char('t')));
+        assert_eq!(app.mode, Mode::Notes);
+        app.phase = Phase::Listening;
+        app.on_key(press(KeyCode::Char('t')));
+        assert_eq!(app.mode, Mode::Notes);
+    }
+
+    /// Enter skips speech while the assistant is talking and waits during thinking.
+    #[test]
+    fn enter_skips_speech_and_waits_while_thinking() {
+        let mut app = talk_app();
+        app.phase = Phase::Thinking;
+        assert_eq!(app.on_key(press(KeyCode::Enter)), None);
+        app.phase = Phase::Speaking;
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Some(Action::Skip));
+    }
+
+    /// `r` reads the latest answer aloud, only when there is one.
+    #[test]
+    fn r_reads_the_last_reply() {
+        let mut app = talk_app();
+        assert_eq!(app.on_key(press(KeyCode::Char('r'))), None);
+        app.push_turn("hello".into());
+        assert_eq!(app.on_key(press(KeyCode::Char('r'))), None); // still pending
+        app.set_reply(Reply::Text("Hi there.".into()));
+        assert_eq!(app.readable().as_deref(), Some("Hi there."));
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('r'))),
+            Some(Action::ReadAloud)
+        );
+    }
+
+    /// In notes mode `r` reads the transcript, preferring the cleaned text.
+    #[test]
+    fn r_reads_notes_in_notes_mode() {
+        let mut app = App::new(false);
+        assert_eq!(app.on_key(press(KeyCode::Char('r'))), None);
+        let id = app.queue();
+        app.on_outcome(Outcome::Text {
+            id,
+            text: "raw words".into(),
+        });
+        assert_eq!(app.readable().as_deref(), Some("raw words"));
+        app.cleaned = Some("Clean words.".into());
+        assert_eq!(app.readable().as_deref(), Some("Clean words."));
+    }
+
+    /// `n` clears the conversation and asks the backend to forget it.
+    #[test]
+    fn n_starts_a_new_conversation() {
+        let mut app = talk_app();
+        app.push_turn("one".into());
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('n'))),
+            Some(Action::NewConversation)
+        );
+        assert!(app.turns.is_empty());
+        let mut notes = App::new(false);
+        assert_eq!(notes.on_key(press(KeyCode::Char('n'))), None);
+    }
+
+    /// Failed answers are shown but never read aloud.
+    #[test]
+    fn failed_replies_are_not_readable() {
+        let mut app = talk_app();
+        app.push_turn("hello".into());
+        app.set_reply(Reply::Failed("server down".into()));
+        assert_eq!(app.readable(), None);
+    }
+
+    /// The conversation pane shows both sides, the backend name and talk key help.
+    #[test]
+    fn draws_conversation() {
+        let mut app = talk_app();
+        app.push_turn("what is two plus two".into());
+        app.set_reply(Reply::Text("Four.".into()));
+        app.push_turn("and times two".into());
+        let text = screen(&app);
+        for expected in [
+            "Conversation",
+            "talk · qwen-reasoner",
+            "what is two plus two",
+            "Four.",
+            "and times two",
+            "thinking",
+            " new",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+    }
+
+    /// While you are speaking, your words appear live as the current question.
+    #[test]
+    fn shows_live_question_while_listening() {
+        let mut app = talk_app();
+        app.begin();
+        app.on_tick(0.3, Some(0.1), true);
+        let id = app.queue();
+        app.on_outcome(Outcome::Text {
+            id,
+            text: "how do I list files".into(),
+        });
+        let text = screen(&app);
+        assert!(text.contains("how do I list files") && text.contains("LISTENING"));
+    }
+
+    /// The idle talk screen explains what to do, and muted speech is shown.
+    #[test]
+    fn idle_talk_screen_and_muted_flag() {
+        let app = App::new(false).with_talk(true, "claude".to_string(), false);
+        let text = screen(&app);
+        assert!(text.contains("ask your question") && text.contains("muted"));
     }
 }
