@@ -2,6 +2,7 @@
 //! and say what is missing (with a preview of what a managed install would add).
 
 use crate::config::Config;
+use crate::endpoints::{DEFAULT_STT_MODEL, Endpoints};
 use crate::hardware::{self, Hardware, Tier, gib};
 use crate::latency::{self, Latency, ModelSpeed, Rating, Targets};
 use crate::profile;
@@ -10,9 +11,6 @@ use anyhow::Result;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
 use std::time::Duration;
-
-/// The OpenAI-compatible server that normally hosts Whisper and the chat models.
-pub const SERVER: &str = "http://127.0.0.1:8080";
 
 /// Places a Kokoro speech endpoint is commonly found, best guess first.
 pub const KOKORO_CANDIDATES: [&str; 2] = [
@@ -23,6 +21,8 @@ pub const KOKORO_CANDIDATES: [&str; 2] = [
 /// What the probe found on this machine.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Findings {
+    /// The model-list URL that was asked, for messages.
+    pub models_url: String,
     /// Model ids served by the local server, or `None` if it could not be reached.
     pub models: Option<Vec<String>>,
     /// A Kokoro endpoint that answered with audio.
@@ -41,15 +41,24 @@ pub struct Findings {
 
 /// Look around this machine: what is available, what the hardware is, and (unless `quick`) how
 /// fast the models answer. Timing can take a minute if the models have to load first.
-pub async fn probe(client: &reqwest::Client, quick: bool) -> Findings {
-    let candidates: Vec<String> = KOKORO_CANDIDATES.iter().map(ToString::to_string).collect();
-    let mut found = probe_at(client, SERVER, &candidates).await;
+pub async fn probe(client: &reqwest::Client, endpoints: &Endpoints, quick: bool) -> Findings {
+    // The configured speech endpoint first, then the usual places.
+    let mut candidates = vec![endpoints.tts.clone()];
+    for usual in KOKORO_CANDIDATES {
+        if !candidates.iter().any(|c| c == usual) {
+            candidates.push(usual.to_string());
+        }
+    }
+    let mut found = probe_at(client, &endpoints.models, &candidates).await;
     found.hardware = tokio::task::spawn_blocking(hardware::detect).await.ok();
     if !quick && let Some(ids) = &found.models {
         let chat = pick_chat_model(ids);
         let smart = pick_smart_model(ids).filter(|smart| Some(smart) != chat.as_ref());
+        let whisper = pick_whisper(ids);
         let targets = Targets {
-            whisper: pick_whisper(ids).is_some(),
+            whisper: whisper.is_some(),
+            stt_model: whisper.unwrap_or_default(),
+            endpoints: endpoints.clone(),
             chat_model: chat.as_deref(),
             smart_model: smart.as_deref(),
             kokoro_url: found.kokoro_url.as_deref(),
@@ -59,10 +68,10 @@ pub async fn probe(client: &reqwest::Client, quick: bool) -> Findings {
     found
 }
 
-/// Like [`probe`], with the server and Kokoro candidates given explicitly.
+/// Like [`probe`], with the model-list URL and Kokoro candidates given explicitly.
 pub async fn probe_at(
     client: &reqwest::Client,
-    server: &str,
+    models_url: &str,
     kokoro_candidates: &[String],
 ) -> Findings {
     let mut kokoro_url = None;
@@ -78,7 +87,8 @@ pub async fn probe_at(
         "espeak-ng"
     };
     Findings {
-        models: list_models(client, server).await,
+        models_url: models_url.to_string(),
+        models: list_models(client, models_url).await,
         kokoro_url,
         system_voice: find_in_path(system_command).map(|_| system_command),
         player: ["afplay", "paplay", "pw-play", "aplay"]
@@ -90,9 +100,9 @@ pub async fn probe_at(
     }
 }
 
-async fn list_models(client: &reqwest::Client, server: &str) -> Option<Vec<String>> {
+async fn list_models(client: &reqwest::Client, models_url: &str) -> Option<Vec<String>> {
     let body: serde_json::Value = client
-        .get(format!("{server}/v1/models"))
+        .get(models_url)
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -260,7 +270,13 @@ pub fn plan(found: &Findings) -> Plan {
     let mut config = Config::default();
 
     let stt = match pick_whisper(ids) {
-        Some(id) => Status::Ready(format!("{id} (on the server)")),
+        Some(id) => {
+            if id != DEFAULT_STT_MODEL {
+                // The server names it differently, so remember the name to ask for.
+                config.stt_model = Some(id.clone());
+            }
+            Status::Ready(format!("{id} (on the server)"))
+        }
         None => Status::Missing,
     };
 
@@ -669,7 +685,14 @@ pub fn render(found: &Findings, plan: &Plan) -> String {
     let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
     let _ = writeln!(out, "  [ok] {:<15} {}", "Profiles", names.join(", "));
     let (mark, what, text) = match (found.models.is_some(), found.player) {
-        (false, _) => ("!!", "Server", format!("no server answered at {SERVER}")),
+        (false, _) => {
+            let url = if found.models_url.is_empty() {
+                Endpoints::default().models
+            } else {
+                found.models_url.clone()
+            };
+            ("!!", "Server", format!("no server answered at {url}"))
+        }
         (true, None) => ("!!", "Playback", "no audio player found".to_string()),
         (true, Some(player)) => ("ok", "Playback", player.to_string()),
     };
@@ -782,6 +805,11 @@ pub fn overlay(base: Config, new: &Config) -> Config {
         tts_voice: new.tts_voice.clone().or(base.tts_voice),
         voice: new.voice.clone().or(base.voice),
         language: new.language.clone().or(base.language),
+        server: new.server.clone().or(base.server),
+        stt_url: new.stt_url.clone().or(base.stt_url),
+        chat_url: new.chat_url.clone().or(base.chat_url),
+        models_url: new.models_url.clone().or(base.models_url),
+        stt_model: new.stt_model.clone().or(base.stt_model),
         profile: new.profile.clone().or(base.profile),
         smart_model: new.smart_model.clone().or(base.smart_model),
         profiles: {
@@ -797,14 +825,14 @@ pub fn overlay(base: Config, new: &Config) -> Config {
 /// # Errors
 ///
 /// Returns an error if the saved config cannot be read or the new one cannot be written.
-pub async fn run(yes: bool, check_only: bool, quick: bool) -> Result<()> {
+pub async fn run(endpoints: &Endpoints, yes: bool, check_only: bool, quick: bool) -> Result<()> {
     let client = reqwest::Client::new();
     if quick {
         println!("Looking around...\n");
     } else {
         println!("Looking around and timing your models (this can take a minute)...\n");
     }
-    let found = probe(&client, quick).await;
+    let found = probe(&client, endpoints, quick).await;
     let plan = plan(&found);
     print!("{}", render(&found, &plan));
     if check_only {
@@ -1437,5 +1465,76 @@ mod tests {
             text.contains("Total download: 18.6 GB") && !text.contains("about 18"),
             "{text}"
         );
+    }
+
+    /// When the server calls the Whisper model something else, setup remembers that name; the
+    /// default name is not written.
+    #[test]
+    fn remembers_a_different_whisper_name() {
+        let found = Findings {
+            models: Some(ids(&["whisper-large-v3", "qwen3-coder-30b"])),
+            ..everything()
+        };
+        assert_eq!(
+            plan(&found).config.stt_model.as_deref(),
+            Some("whisper-large-v3")
+        );
+        let plain = plan(&everything());
+        assert_eq!(
+            plain.config.stt_model, None,
+            "the default name needs no saving"
+        );
+    }
+
+    /// The report names the model-list URL that was asked, so a wrong address is easy to spot.
+    #[test]
+    fn report_names_the_server_that_did_not_answer() {
+        let found = Findings {
+            models_url: "http://gpu-box:9000/v1/models".into(),
+            ..Findings::default()
+        };
+        let text = render(&found, &plan(&found));
+        assert!(
+            text.contains("no server answered at http://gpu-box:9000/v1/models"),
+            "{text}"
+        );
+        let unset = render(&Findings::default(), &plan(&Findings::default()));
+        assert!(
+            unset.contains("no server answered at http://127.0.0.1:8080/v1/models"),
+            "{unset}"
+        );
+    }
+
+    /// The probe asks the model-list URL it is given, whatever its path.
+    #[tokio::test]
+    async fn probe_asks_the_given_models_url() {
+        let (base, request) = crate::test_support::capture_once(
+            "application/json",
+            r#"{"data":[{"id":"whisper"},{"id":"my-chat"}]}"#,
+        )
+        .await;
+        let url = format!("{base}/custom/models");
+        let found = probe_at(&reqwest::Client::new(), &url, &[]).await;
+        assert_eq!(found.models, Some(ids(&["whisper", "my-chat"])));
+        assert_eq!(found.models_url, url);
+        assert!(request.await.unwrap().starts_with("GET /custom/models "));
+    }
+
+    /// Saved endpoint keys survive a later setup run, and new values replace old ones.
+    #[test]
+    fn overlay_keeps_endpoint_settings() {
+        let saved = Config {
+            server: Some("http://gpu-box:8080".into()),
+            stt_url: Some("http://stt/x".into()),
+            ..Config::default()
+        };
+        let new = Config {
+            stt_model: Some("whisper-large-v3".into()),
+            ..Config::default()
+        };
+        let merged = overlay(saved, &new);
+        assert_eq!(merged.server.as_deref(), Some("http://gpu-box:8080"));
+        assert_eq!(merged.stt_url.as_deref(), Some("http://stt/x"));
+        assert_eq!(merged.stt_model.as_deref(), Some("whisper-large-v3"));
     }
 }

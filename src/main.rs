@@ -5,6 +5,7 @@ use std::io::IsTerminal;
 mod audio;
 mod chat;
 mod config;
+mod endpoints;
 mod hardware;
 mod latency;
 mod pipeline;
@@ -15,13 +16,15 @@ mod speech;
 mod transcribe;
 mod ui;
 
+#[cfg(test)]
+mod test_support;
+
 use chat::Backend;
 use config::Config;
+use endpoints::{DEFAULT_STT_MODEL, Endpoints};
 use pipeline::Settings;
 use profile::Profile;
 use speech::{KokoroConfig, SpeechConfig};
-
-const DEFAULT_TTS_URL: &str = "http://127.0.0.1:8880/v1/audio/speech";
 
 /// How replies are spoken.
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
@@ -106,10 +109,30 @@ struct Args {
     #[arg(long, value_enum)]
     tts: Option<TtsArg>,
 
-    /// Kokoro speech endpoint (OpenAI-compatible `/v1/audio/speech`)
-    /// (default `http://127.0.0.1:8880/v1/audio/speech`)
-    #[arg(long)]
+    /// Speech endpoint, `POST /v1/audio/speech` (default `http://127.0.0.1:8880/v1/audio/speech`)
+    #[arg(long, global = true)]
     tts_url: Option<String>,
+
+    /// One server for speech-to-text, chat and the model list, e.g. `http://gpu-box:8080`
+    /// (default `http://127.0.0.1:8080`); the three URLs below override it one by one
+    #[arg(long, global = true)]
+    server: Option<String>,
+
+    /// Speech-to-text endpoint, `POST /v1/audio/transcriptions`
+    #[arg(long, global = true)]
+    stt_url: Option<String>,
+
+    /// Chat endpoint, `POST /v1/chat/completions`
+    #[arg(long, global = true)]
+    chat_url: Option<String>,
+
+    /// Model-list endpoint, `GET /v1/models`
+    #[arg(long, global = true)]
+    models_url: Option<String>,
+
+    /// Model name sent to the speech-to-text endpoint [default: whisper]
+    #[arg(long, global = true)]
+    stt_model: Option<String>,
 
     /// Model name sent to the Kokoro server [default: kokoro]
     #[arg(long)]
@@ -139,6 +162,35 @@ struct Args {
 /// profile apply only to the profile chosen at launch.
 fn resolve(args: &Args, config: &Config, profile_override: Option<&str>) -> Result<Settings> {
     resolve_with(args, config, profile_override, profile::available(config))
+}
+
+/// Work out the four endpoints. From highest priority to lowest: an individual flag, the
+/// `--server` flag, an individual key in the config file, the config's `server`, the default.
+fn resolve_endpoints(args: &Args, config: &Config) -> Result<Endpoints> {
+    let flag_server = args.server.as_deref().map(Endpoints::from_base);
+    let saved_server = config.server.as_deref().map(Endpoints::from_base);
+    let default = Endpoints::default();
+    let choose =
+        |flag: &Option<String>, saved: &Option<String>, field: fn(&Endpoints) -> &String| {
+            flag.clone()
+                .or_else(|| flag_server.as_ref().map(|e| field(e).clone()))
+                .or_else(|| saved.clone())
+                .or_else(|| saved_server.as_ref().map(|e| field(e).clone()))
+                .unwrap_or_else(|| field(&default).clone())
+        };
+    let endpoints = Endpoints {
+        stt: choose(&args.stt_url, &config.stt_url, |e| &e.stt),
+        chat: choose(&args.chat_url, &config.chat_url, |e| &e.chat),
+        models: choose(&args.models_url, &config.models_url, |e| &e.models),
+        // Speech is a separate service, so `server` does not move it.
+        tts: args
+            .tts_url
+            .clone()
+            .or_else(|| config.tts_url.clone())
+            .unwrap_or(default.tts),
+    };
+    endpoints.validate()?;
+    Ok(endpoints)
 }
 
 fn resolve_with(
@@ -191,8 +243,14 @@ fn resolve_with(
             .unwrap_or_else(|| default.to_string())
     };
     let language = pick(&args.language, &config.language, "en");
+    let endpoints = resolve_endpoints(args, config)?;
 
     Ok(Settings {
+        stt_model: pick(&args.stt_model, &config.stt_model, DEFAULT_STT_MODEL),
+        clean_model: config
+            .chat_model
+            .clone()
+            .unwrap_or_else(|| profile::DEFAULT_FAST_MODEL.to_string()),
         clean: args.clean,
         min_threshold: args.threshold,
         language: (language != "auto").then_some(language),
@@ -204,13 +262,14 @@ fn resolve_with(
         speak: !args.no_speech,
         speech: SpeechConfig {
             kokoro: (tts == TtsArg::Kokoro).then(|| KokoroConfig {
-                url: pick(&args.tts_url, &config.tts_url, DEFAULT_TTS_URL),
+                url: endpoints.tts.clone(),
                 model: pick(&args.tts_model, &config.tts_model, "kokoro"),
                 voice: pick(&args.tts_voice, &config.tts_voice, "af_heart"),
             }),
             ..SpeechConfig::system(pick(&args.voice, &config.voice, "en"))
         },
         talk: args.talk,
+        endpoints,
     })
 }
 
@@ -218,7 +277,9 @@ fn resolve_with(
 async fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(Command::Setup { yes, check, quick }) = args.command {
-        return setup::run(yes, check, quick).await;
+        let config = Config::load()?;
+        let endpoints = resolve_endpoints(&args, &config)?;
+        return setup::run(&endpoints, yes, check, quick).await;
     }
 
     let config = Config::load()?;
@@ -282,7 +343,7 @@ mod tests {
         assert_eq!(s.system_prompt, None);
         assert_eq!(s.language.as_deref(), Some("en"));
         let kokoro = s.speech.kokoro.unwrap();
-        assert_eq!(kokoro.url, DEFAULT_TTS_URL);
+        assert_eq!(kokoro.url, endpoints::DEFAULT_TTS_URL);
         assert_eq!(kokoro.voice, "af_heart");
         assert_eq!(s.speech.system_voice, "en");
         assert!(s.speak && !s.talk);
@@ -445,6 +506,22 @@ mod tests {
                 quick: false
             })
         ));
+        let parsed = args(&[
+            "setup",
+            "--check",
+            "--server",
+            "http://gpu-box:8080",
+            "--stt-model",
+            "tiny",
+        ]);
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Setup { check: true, .. })
+        ));
+        assert_eq!(parsed.server.as_deref(), Some("http://gpu-box:8080"));
+        assert_eq!(parsed.stt_model.as_deref(), Some("tiny"));
+        let before = args(&["--server", "http://gpu-box:8080", "setup", "--check"]);
+        assert_eq!(before.server.as_deref(), Some("http://gpu-box:8080"));
         let parsed = args(&["setup", "--quick", "--check"]);
         assert!(matches!(
             parsed.command,
@@ -455,5 +532,142 @@ mod tests {
             })
         ));
         assert!(args(&["--talk"]).command.is_none());
+    }
+
+    fn endpoints(list: &[&str], config: &Config) -> Result<Endpoints> {
+        resolve_endpoints(&args(list), config)
+    }
+
+    /// With nothing configured the local defaults apply.
+    #[test]
+    fn endpoints_default_to_the_local_server() {
+        let e = endpoints(&[], &Config::default()).unwrap();
+        assert_eq!(e, Endpoints::default());
+        assert_eq!(e.tts, endpoints::DEFAULT_TTS_URL);
+    }
+
+    /// `--server` moves speech-to-text, chat and the model list at once, but not speech.
+    #[test]
+    fn server_flag_sets_three_endpoints() {
+        let e = endpoints(&["--server", "http://gpu-box:9000/"], &Config::default()).unwrap();
+        assert_eq!(e.stt, "http://gpu-box:9000/v1/audio/transcriptions");
+        assert_eq!(e.chat, "http://gpu-box:9000/v1/chat/completions");
+        assert_eq!(e.models, "http://gpu-box:9000/v1/models");
+        assert_eq!(e.tts, endpoints::DEFAULT_TTS_URL);
+    }
+
+    /// Each endpoint can be set on its own, by flag or in the config file.
+    #[test]
+    fn single_endpoints_by_flag_and_config() {
+        let config = Config {
+            chat_url: Some("http://saved/chat".into()),
+            tts_url: Some("http://saved/speech".into()),
+            ..Config::default()
+        };
+        let e = endpoints(&[], &config).unwrap();
+        assert_eq!(e.chat, "http://saved/chat");
+        assert_eq!(e.tts, "http://saved/speech");
+        assert_eq!(
+            e.stt,
+            Endpoints::default().stt,
+            "the others keep their defaults"
+        );
+
+        let e = endpoints(
+            &[
+                "--chat-url",
+                "http://flag/chat",
+                "--stt-url",
+                "http://flag/stt",
+                "--models-url",
+                "http://flag/models",
+            ],
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            (e.chat.as_str(), e.stt.as_str(), e.models.as_str()),
+            ("http://flag/chat", "http://flag/stt", "http://flag/models")
+        );
+        assert_eq!(e.tts, "http://saved/speech");
+    }
+
+    /// Priority from highest to lowest: individual flag, `--server`, individual config key,
+    /// config `server`, default.
+    #[test]
+    fn endpoint_precedence() {
+        let config = Config {
+            server: Some("http://config-server".into()),
+            chat_url: Some("http://config-chat".into()),
+            ..Config::default()
+        };
+        // Config only: the individual key beats the config's server.
+        let e = endpoints(&[], &config).unwrap();
+        assert_eq!(e.chat, "http://config-chat");
+        assert_eq!(e.stt, "http://config-server/v1/audio/transcriptions");
+        // The server flag beats the config's individual key.
+        let e = endpoints(&["--server", "http://flag-server"], &config).unwrap();
+        assert_eq!(e.chat, "http://flag-server/v1/chat/completions");
+        // An individual flag beats everything.
+        let e = endpoints(
+            &[
+                "--server",
+                "http://flag-server",
+                "--chat-url",
+                "http://flag-chat",
+            ],
+            &config,
+        )
+        .unwrap();
+        assert_eq!(e.chat, "http://flag-chat");
+        assert_eq!(e.stt, "http://flag-server/v1/audio/transcriptions");
+    }
+
+    /// A malformed endpoint stops the program with a message that names it.
+    #[test]
+    fn bad_endpoint_is_an_error() {
+        let err = endpoints(&["--chat-url", "localhost:8080"], &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("chat") && err.contains("localhost:8080"),
+            "{err}"
+        );
+        let bad_config = Config {
+            server: Some("gpu-box:8080".into()),
+            ..Config::default()
+        };
+        assert!(endpoints(&[], &bad_config).is_err());
+        assert!(settings(&["--stt-url", "nope"], &Config::default(), false).is_err());
+    }
+
+    /// The endpoints and model names reach the settings the app runs with.
+    #[test]
+    fn settings_carry_endpoints_and_model_names() {
+        let s = settings(&[], &Config::default(), false).unwrap();
+        assert_eq!(s.endpoints, Endpoints::default());
+        assert_eq!(s.stt_model, "whisper");
+        assert_eq!(s.clean_model, profile::DEFAULT_FAST_MODEL);
+        assert_eq!(s.speech.kokoro.unwrap().url, endpoints::DEFAULT_TTS_URL);
+
+        let config = Config {
+            stt_model: Some("whisper-large-v3".into()),
+            chat_model: Some("my-chat".into()),
+            server: Some("http://gpu-box:8080".into()),
+            ..Config::default()
+        };
+        let s = settings(&[], &config, false).unwrap();
+        assert_eq!(s.stt_model, "whisper-large-v3");
+        assert_eq!(s.clean_model, "my-chat");
+        assert_eq!(s.endpoints.chat, "http://gpu-box:8080/v1/chat/completions");
+        let s = settings(
+            &["--stt-model", "tiny", "--tts-url", "http://voice/speech"],
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(s.stt_model, "tiny");
+        assert_eq!(s.endpoints.tts, "http://voice/speech");
+        assert_eq!(s.speech.kokoro.unwrap().url, "http://voice/speech");
     }
 }

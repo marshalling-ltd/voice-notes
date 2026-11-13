@@ -1,5 +1,6 @@
 //! Conversation with a chat backend: your local models, or Claude through the CLI.
 
+use crate::endpoints::Endpoints;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
@@ -252,13 +253,14 @@ fn new_session_id() -> String {
 /// Ask the local server for a streamed answer, forwarding the visible text as it arrives.
 async fn stream_local(
     client: &reqwest::Client,
+    url: &str,
     model: &str,
     think: bool,
     messages: &[ChatMessage],
     deltas: Option<&UnboundedSender<ReplyDelta>>,
 ) -> Result<String> {
     let mut response = client
-        .post("http://127.0.0.1:8080/v1/chat/completions")
+        .post(url)
         .timeout(REPLY_TIMEOUT)
         .json(&Request {
             model,
@@ -309,6 +311,7 @@ async fn stream_local(
 /// A multi-turn conversation that remembers what was said.
 pub struct Conversation {
     backend: Backend,
+    url: String,
     prompt: String,
     history: Vec<ChatMessage>,
     session: String,
@@ -320,11 +323,19 @@ impl Conversation {
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
+            url: Endpoints::default().chat,
             prompt: SPOKEN_STYLE.to_string(),
             history: Vec::new(),
             session: new_session_id(),
             started: false,
         }
+    }
+
+    /// Send chat requests to `url` instead of the default local server.
+    #[must_use]
+    pub fn with_url(mut self, url: String) -> Self {
+        self.url = url;
+        self
     }
 
     /// Use `prompt` as the system prompt instead of the default spoken style.
@@ -391,7 +402,7 @@ impl Conversation {
         let mut messages = vec![ChatMessage::new("system", &self.prompt)];
         messages.extend_from_slice(&self.history[start..]);
 
-        match stream_local(client, model, think, &messages, deltas).await {
+        match stream_local(client, &self.url, model, think, &messages, deltas).await {
             Ok(reply) => {
                 self.history.push(ChatMessage::new("assistant", &reply));
                 Ok(reply)
@@ -633,5 +644,76 @@ mod tests {
             .position(|a| a == "--append-system-prompt")
             .unwrap();
         assert_eq!(args[at + 1], DEV_STYLE);
+    }
+
+    /// Chat requests go to the local server unless another URL is given.
+    #[test]
+    fn chat_url_defaults_and_can_be_changed() {
+        let default = Conversation::new(Backend::Claude);
+        assert_eq!(default.url, "http://127.0.0.1:8080/v1/chat/completions");
+        let custom = Conversation::new(Backend::Claude)
+            .with_url("http://gpu-box:9000/v1/chat/completions".into());
+        assert_eq!(custom.url, "http://gpu-box:9000/v1/chat/completions");
+    }
+
+    const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Four\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" it is.\"}}]}\n\ndata: [DONE]\n\n";
+
+    /// A streamed reply is read from the configured URL, with the configured model, and the
+    /// pieces arrive in order.
+    #[tokio::test]
+    async fn streams_from_the_configured_url() {
+        let (base, request) = crate::test_support::capture_once("text/event-stream", SSE).await;
+        let backend = Backend::Local {
+            model: "my-chat-model".into(),
+            think: false,
+        };
+        let mut conversation =
+            Conversation::new(backend).with_url(format!("{base}/elsewhere/chat"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = conversation
+            .reply(&reqwest::Client::new(), "What is two plus two?", Some(&tx))
+            .await
+            .unwrap();
+        assert_eq!(reply, "Four it is.");
+
+        let mut pieces = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            pieces.push(delta);
+        }
+        assert_eq!(
+            pieces,
+            [
+                ReplyDelta::Text("Four".into()),
+                ReplyDelta::Text(" it is.".into())
+            ]
+        );
+        let sent = request.await.unwrap();
+        assert!(sent.starts_with("POST /elsewhere/chat "), "{sent}");
+        assert!(
+            sent.contains("\"model\":\"my-chat-model\"") && sent.contains("\"stream\":true"),
+            "{sent}"
+        );
+        assert!(sent.contains("What is two plus two?"));
+    }
+
+    /// An unreachable chat server is an error, and the failed question is forgotten.
+    #[tokio::test]
+    async fn unreachable_chat_server_is_an_error() {
+        let backend = Backend::Local {
+            model: "m".into(),
+            think: false,
+        };
+        let mut conversation =
+            Conversation::new(backend).with_url("http://127.0.0.1:1/v1/chat/completions".into());
+        assert!(
+            conversation
+                .reply(&reqwest::Client::new(), "hi", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            conversation.history.is_empty(),
+            "the failed question is not kept"
+        );
     }
 }
