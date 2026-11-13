@@ -88,6 +88,12 @@ pub fn is_hallucination(text: &str) -> bool {
     words.windows(5).any(|w| w.iter().all(|x| *x == w[0]))
 }
 
+/// Send a WAV clip to the Whisper-compatible server and return the recognised text.
+///
+/// # Errors
+///
+/// Returns an error if the request fails, the server answers with an error status, or the
+/// response is not the expected JSON.
 pub async fn transcribe_audio(
     client: &Client,
     audio_data: &[u8],
@@ -122,6 +128,12 @@ pub async fn transcribe_audio(
     Ok(transcription_response.text)
 }
 
+/// Ask the chat model to fix punctuation, capitalization and grammar without changing meaning.
+///
+/// # Errors
+///
+/// Returns an error if the request fails, the server answers with an error status, or the
+/// response is not the expected JSON.
 pub async fn clean_transcript(client: &Client, raw_text: &str) -> Result<String> {
     let request = CleanTranscriptRequest {
         model: "qwen3-coder-30b",

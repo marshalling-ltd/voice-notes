@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - release
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux x86_64 — release binary packaged as a tarball with a checksum
+  # ---------------------------------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libasound2-dev pkg-config build-essential
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist/voice-notes
+          cp target/release/voice-notes dist/voice-notes/
+          cp README.md dist/voice-notes/
+          tar -C dist -czf voice-notes.linux-x64.tar.gz voice-notes
+          sha256sum voice-notes.linux-x64.tar.gz > voice-notes.linux-x64.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: |
+            voice-notes.linux-x64.tar.gz
+            voice-notes.linux-x64.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  # Publish — versioned release on tags, rolling prerelease on the release branch
+  # ---------------------------------------------------------------------------
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          APP_VERSION="$(sed -n 's/^version = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$APP_VERSION" ]]; then
+            echo "Could not find package version in Cargo.toml." >&2
+            exit 1
+          fi
+          if [[ "$TAG" != "v$APP_VERSION" ]]; then
+            echo "Tag ($TAG) does not match Cargo.toml version (v$APP_VERSION)." >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-x64
+          path: artifacts/
+
+      - name: Create tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          NOTES="$(cat <<EOF
+          Built from commit \`${GITHUB_SHA}\`.
+
+          ## Downloads
+
+          | Platform | File | Notes |
+          |----------|------|-------|
+          | **Linux** x64 | \`voice-notes.linux-x64.tar.gz\` | Needs ALSA (\`libasound2\`) and a Whisper-compatible server on 127.0.0.1:8080. Verify with the \`.sha256\` file. |
+          EOF
+          )"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" \
+            artifacts/voice-notes.linux-x64.tar.gz \
+            artifacts/voice-notes.linux-x64.tar.gz.sha256 \
+            --clobber
+
+      - name: Create/update latest release mirror
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            SOURCE_LABEL="${GITHUB_REF#refs/tags/}"
+            CONTEXT_LINE="Tagged release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${SOURCE_LABEL}"
+          else
+            SOURCE_LABEL="release-${GITHUB_SHA::7}"
+            CONTEXT_LINE="Release branch build (no version tag yet)."
+          fi
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest \
+            --title "Latest (${SOURCE_LABEL})" \
+            --prerelease \
+            --notes "$(cat <<EOF
+          Rolling latest pre-release mirror built from commit \`${GITHUB_SHA}\`.
+
+          ${CONTEXT_LINE}
+          EOF
+          )" \
+            artifacts/voice-notes.linux-x64.tar.gz \
+            artifacts/voice-notes.linux-x64.tar.gz.sha256

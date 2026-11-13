@@ -25,9 +25,15 @@ const PREROLL_MS: usize = 200;
 /// Force a cut if someone talks without pausing for this long.
 const MAX_SEGMENT_MS: usize = 20_000;
 
+/// Frame and buffer lengths are far below 2^24, so this conversion is exact in practice.
+#[allow(clippy::cast_precision_loss)]
+fn count(n: usize) -> f32 {
+    n as f32
+}
+
 /// RMS of a frame with its DC offset removed.
 fn ac_rms(frame: &[f32]) -> f32 {
-    let n = frame.len() as f32;
+    let n = count(frame.len());
     let mean = frame.iter().sum::<f32>() / n;
     (frame.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n).sqrt()
 }
@@ -167,7 +173,11 @@ impl AudioRecorder {
     }
 
     /// Open the default input device and start capturing in a background thread.
-    /// Returns an error immediately if the device cannot be opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error immediately if already recording, or if the input device cannot be
+    /// found, configured or started.
     pub fn start_recording(&mut self) -> Result<()> {
         if self.worker.is_some() {
             bail!("already recording");
@@ -241,6 +251,10 @@ impl AudioRecorder {
     }
 
     /// Return WAV bytes (16 kHz mono 16-bit) for each utterance finished since the last call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if not recording, or if the capture buffer or WAV encoding fails.
     pub fn poll_segments(&mut self) -> Result<Vec<Vec<u8>>> {
         if self.worker.is_none() {
             bail!("not recording");
@@ -262,6 +276,10 @@ impl AudioRecorder {
     }
 
     /// Stop capturing and return the trailing utterance, if it contained speech.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if not recording, the audio thread panicked, or WAV encoding fails.
     pub fn stop_recording(&mut self) -> Result<Option<Vec<u8>>> {
         self.stop_flag.store(true, Ordering::Relaxed);
         let worker = self.worker.take().context("not recording")?;
@@ -349,7 +367,7 @@ where
                     // Downmix interleaved frames to mono.
                     for frame in data.chunks(channels) {
                         let sum: f32 = frame.iter().map(|&s| f32::from_sample(s)).sum();
-                        buf.push(sum / frame.len() as f32);
+                        buf.push(sum / count(frame.len()));
                     }
                 }
             },
@@ -360,6 +378,14 @@ where
 }
 
 /// Linear-interpolation resampler; adequate for speech.
+///
+/// Indices stay well inside f64's exact integer range and are never negative, so the
+/// float/integer casts below cannot lose information.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || input.is_empty() {
         return input.to_vec();
@@ -398,6 +424,7 @@ fn encode_wav(samples: &[f32]) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 
@@ -432,12 +459,16 @@ mod tests {
     #[test]
     fn finish_flushes_trailing_speech() {
         let mut seg = Segmenter::new(16_000, 0.01);
-        assert_eq!(seg.push(&tone(16_000, 800, 0.3)), [] as [std::vec::Vec<f32>; 0]);
+        assert_eq!(
+            seg.push(&tone(16_000, 800, 0.3)),
+            [] as [std::vec::Vec<f32>; 0]
+        );
         assert!(seg.finish().is_some());
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss)]
 mod calibration_tests {
     use super::*;
 
