@@ -1,9 +1,9 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ fn noise_threshold(ambient: &[f32], sample_rate: u32, min_threshold: f32) -> f32
     if levels.is_empty() {
         return min_threshold;
     }
-    levels.sort_by(|a, b| a.total_cmp(b));
+    levels.sort_by(f32::total_cmp);
     let p95 = levels[(levels.len() * 95 / 100).min(levels.len() - 1)];
     (p95 * NOISE_MARGIN).max(min_threshold)
 }
@@ -150,6 +150,7 @@ pub struct AudioRecorder {
 impl AudioRecorder {
     /// `min_threshold` is the lowest RMS level (0.0-1.0) ever treated as speech; the real
     /// gate is calibrated from ambient noise after recording starts.
+    #[must_use]
     pub fn new(min_threshold: f32, verbose: bool) -> Self {
         Self {
             min_threshold,
@@ -214,6 +215,7 @@ impl AudioRecorder {
     }
 
     /// The calibrated speech gate, or `None` while still measuring ambient noise.
+    #[must_use]
     pub fn calibrated_threshold(&self) -> Option<f32> {
         self.threshold
     }
@@ -423,14 +425,14 @@ mod tests {
         let mut audio = vec![0.0; 16_000];
         audio.extend(tone(16_000, 60, 0.3));
         audio.extend(vec![0.0; 16_000]);
-        assert!(seg.push(&audio).is_empty());
+        assert_eq!(seg.push(&audio), [] as [std::vec::Vec<f32>; 0]);
         assert!(seg.finish().is_none());
     }
 
     #[test]
     fn finish_flushes_trailing_speech() {
         let mut seg = Segmenter::new(16_000, 0.01);
-        assert!(seg.push(&tone(16_000, 800, 0.3)).is_empty());
+        assert_eq!(seg.push(&tone(16_000, 800, 0.3)), [] as [std::vec::Vec<f32>; 0]);
         assert!(seg.finish().is_some());
     }
 }
