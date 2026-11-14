@@ -7,6 +7,7 @@ mod chat;
 mod config;
 mod endpoints;
 mod hardware;
+mod headless;
 mod latency;
 mod pipeline;
 mod plain;
@@ -46,6 +47,20 @@ enum BackendArg {
 
 #[derive(Subcommand, Clone)]
 enum Command {
+    /// Run one voice turn without a microphone: a recording is transcribed, answered and
+    /// spoken. For tests and scripts. Exit code: 0 ok, 10 recording, 11 transcribing, 12 chat,
+    /// 13 speech
+    Turn {
+        /// The recording that stands in for the microphone (any WAV file)
+        #[arg(long)]
+        input_wav: std::path::PathBuf,
+        /// Do not play the reply; still fetch it from the speech service and check it
+        #[arg(long)]
+        no_audio_output: bool,
+        /// Print the result as one JSON object instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Find the models and services you already have, pick the best, and save the choices
     Setup {
         /// Save without asking
@@ -77,7 +92,7 @@ struct Args {
     threshold: f32,
 
     /// Spoken language code passed to Whisper (e.g. en, hr); `auto` lets it detect [default: en]
-    #[arg(long)]
+    #[arg(long, global = true)]
     language: Option<String>,
 
     /// Use the line-by-line interface instead of the full-screen one
@@ -90,23 +105,23 @@ struct Args {
 
     /// Profile: how the assistant answers (`fast`, `dev`, `smart`, `think`, `claude`, or your
     /// own from the config file) [default: the saved one, else `fast`]
-    #[arg(long)]
+    #[arg(long, global = true)]
     profile: Option<String>,
 
     /// Override the profile's backend
-    #[arg(long, value_enum)]
+    #[arg(long, global = true, value_enum)]
     backend: Option<BackendArg>,
 
     /// Override the profile's local model, e.g. qwen3-coder-30b or qwen-reasoner
-    #[arg(long)]
+    #[arg(long, global = true)]
     chat_model: Option<String>,
 
     /// Let the model think before answering (much slower; the `think` profile does this)
-    #[arg(long)]
+    #[arg(long, global = true)]
     think: bool,
 
     /// How replies are spoken [default: kokoro]
-    #[arg(long, value_enum)]
+    #[arg(long, global = true, value_enum)]
     tts: Option<TtsArg>,
 
     /// Speech endpoint, `POST /v1/audio/speech` (default `http://127.0.0.1:8880/v1/audio/speech`)
@@ -135,20 +150,20 @@ struct Args {
     stt_model: Option<String>,
 
     /// Model name sent to the Kokoro server [default: kokoro]
-    #[arg(long)]
+    #[arg(long, global = true)]
     tts_model: Option<String>,
 
     /// Kokoro voice, e.g. `af_heart`, `af_bella`, `am_michael`, `bf_emma` (default `af_heart`)
-    #[arg(long)]
+    #[arg(long, global = true)]
     tts_voice: Option<String>,
 
     /// System voice for --tts system and as the fallback (espeak-ng voice such as en or en-gb;
     /// a `say` voice on macOS) [default: en]
-    #[arg(long)]
+    #[arg(long, global = true)]
     voice: Option<String>,
 
     /// Do not speak replies aloud
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_speech: bool,
 
     /// Print the live input level (with --plain) so you can pick a good --threshold
@@ -276,6 +291,33 @@ fn resolve_with(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::Turn {
+        input_wav,
+        no_audio_output,
+        json,
+    }) = &args.command
+    {
+        let config = Config::load()?;
+        let settings = resolve(&args, &config, None)?;
+        let opts = headless::TurnOptions {
+            wav: input_wav.clone(),
+            no_audio_output: *no_audio_output,
+        };
+        return match headless::run_turn(&reqwest::Client::new(), &settings, &opts).await {
+            Ok(report) => {
+                if *json {
+                    println!("{}", report.to_json());
+                } else {
+                    print!("{}", report.to_text());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("voice-notes: {e}");
+                std::process::exit(e.stage.exit_code());
+            }
+        };
+    }
     if let Some(Command::Setup { yes, check, quick }) = args.command {
         let config = Config::load()?;
         let endpoints = resolve_endpoints(&args, &config)?;
@@ -520,6 +562,35 @@ mod tests {
         ));
         assert_eq!(parsed.server.as_deref(), Some("http://gpu-box:8080"));
         assert_eq!(parsed.stt_model.as_deref(), Some("tiny"));
+        let turn = args(&[
+            "turn",
+            "--input-wav",
+            "q.wav",
+            "--no-audio-output",
+            "--json",
+            "--no-speech",
+            "--profile",
+            "dev",
+            "--tts",
+            "system",
+            "--language",
+            "hr",
+        ]);
+        assert!(matches!(
+            turn.command,
+            Some(Command::Turn {
+                json: true,
+                no_audio_output: true,
+                ..
+            })
+        ));
+        assert!(turn.no_speech && turn.profile.as_deref() == Some("dev"));
+        assert_eq!(turn.tts, Some(TtsArg::System));
+        assert_eq!(turn.language.as_deref(), Some("hr"));
+        assert!(
+            Args::try_parse_from(["voice-notes", "turn"]).is_err(),
+            "--input-wav is required"
+        );
         let before = args(&["--server", "http://gpu-box:8080", "setup", "--check"]);
         assert_eq!(before.server.as_deref(), Some("http://gpu-box:8080"));
         let parsed = args(&["setup", "--quick", "--check"]);

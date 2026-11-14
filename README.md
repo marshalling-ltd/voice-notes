@@ -71,6 +71,44 @@ prompt = "Answer in at most five words."
 description = "Very short answers"
 ```
 
+### Running without a microphone (tests and scripts)
+
+`voice-notes turn` runs one whole voice turn with a recording standing in for the microphone, then prints the result and exits. It needs no terminal and no audio hardware, so it works in CI.
+
+```sh
+voice-notes turn --input-wav question.wav --no-audio-output          # text
+voice-notes turn --input-wav question.wav --no-audio-output --json   # one JSON object
+```
+
+The turn is: read the recording, transcribe it, ask the chat backend, speak the reply.
+
+- `--input-wav FILE` is any WAV file: mono or stereo, any sample rate, integer or float samples. Files streamed from a speech server, which declare an unknown length, are accepted too.
+- `--no-audio-output` does not play the reply. It still asks the speech service for it and checks that audio came back, then throws the audio away, so a test can prove the whole loop without speakers. Without the flag, the reply is played and the command waits until it has finished. With `--no-speech`, or with only a system voice (which cannot be captured), the speech stage is skipped and the report says why.
+- All the usual settings apply, before or after `turn`: `--server`, `--stt-url`, `--chat-url`, `--tts-url`, `--profile`, `--backend`, `--chat-model`, `--language` and so on.
+
+Text output:
+
+```
+Transcript: What is the capital of France?
+Reply: The capital of France is Paris.
+Speech: 95178 bytes of audio received and discarded
+```
+
+JSON output has `transcript`, `reply`, `speech` (`discarded`, `played` or `skipped`), `audio_bytes`, `speech_skipped_because`, `profile`, `backend` and `timings_ms` (`transcribe`, `chat`, `speech`).
+
+**Exit codes.** A failing turn prints which stage failed on stderr and exits with a code that names it:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The turn worked |
+| 10 | The recording is missing or not a WAV file |
+| 11 | Transcription failed or recognised no speech (an empty answer, or a stock phrase such as "Thank you." that models invent for silence) |
+| 12 | The chat backend did not answer |
+| 13 | The speech service failed or returned no audio |
+| 2 | The command line was invalid |
+
+In a CI step this becomes `voice-notes turn --input-wav test.wav --no-audio-output --json`, and a non-zero exit fails the job.
+
 ### Endpoints and the API contract
 
 The app talks to services over HTTP and speaks OpenAI-compatible requests only, so anything that answers the same requests can be swapped in: another machine, a container, a cloud service.
