@@ -13,7 +13,9 @@
 # Settings, all optional (environment variables):
 #   VOICE_NOTES           the client binary                   (default: target/debug/voice-notes)
 #   CLIP                  the recording to send               (default: stack/test-clip.wav)
-#   CHAT_MODEL            model name to ask for chat          (default: qwen3-0.6b)
+#   STACK_PROFILE         compose profile to start            (default: ci)
+#   CHAT_MODEL            model name to ask for chat          (default: qwen3-0.6b; with another
+#                         profile, name its chat model, e.g. qwen3-4b for minimal)
 #   LLAMA_SWAP_PORT, KOKORO_PORT   host ports to use          (defaults: 8080, 8880)
 #   MODELS_FILE, LLAMA_SWAP_CONFIG_FILE   a different model set (paths relative to stack/)
 #   COMPOSE_PROJECT       compose project name                (default: voice-notes-smoke)
@@ -35,7 +37,7 @@ OUT="${OUT_DIR:-$root/smoke-out}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 export LLAMA_SWAP_PORT="${LLAMA_SWAP_PORT:-8080}" KOKORO_PORT="${KOKORO_PORT:-8880}"
 
-compose=(docker compose -p "$PROJECT" -f "$here/compose.yaml")
+compose=(docker compose -p "$PROJECT" -f "$here/compose.yaml" --profile "${STACK_PROFILE:-ci}")
 if [[ -n "${STACK_GPU:-}" ]]; then
   compose+=(-f "$here/compose.gpu.yaml")
 fi
@@ -67,7 +69,7 @@ trap cleanup EXIT
 [[ -f "$CLIP" ]] || fail "the test recording is missing: $CLIP"
 docker info >/dev/null 2>&1 || fail "cannot talk to Docker (is the daemon running, and are you allowed to use it?)"
 
-say "starting the stack (models: ${MODELS_FILE:-./ci-models.toml})"
+say "starting the stack (profile: ${STACK_PROFILE:-ci}; models: ${MODELS_FILE:-from the profile})"
 start=$(date +%s)
 "${compose[@]}" up -d --wait --wait-timeout "$WAIT_TIMEOUT"
 say "the stack is healthy after $(( $(date +%s) - start )) s"

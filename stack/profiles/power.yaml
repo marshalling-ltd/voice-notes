@@ -1,0 +1,51 @@
+# llama-swap configuration for the `power` size class (see power.toml).
+# File names must match the files that fetch_models.py puts into /models.
+
+healthCheckTimeout: 600
+
+models:
+  # Speech to text. The name is what the client sends as the model (its default is "whisper").
+  # --tmp-dir: --convert writes temporary files, and the working directory (/models) is read-only.
+  whisper:
+    ttl: 600
+    cmd: >
+      whisper-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /models/ggml-large-v3-turbo-q5_0.bin
+      --inference-path /v1/audio/transcriptions
+      --convert --tmp-dir /tmp
+
+  # Chat. Use it with: voice-notes --chat-model qwen3-coder-30b
+  qwen3-coder-30b:
+    ttl: 600
+    cmd: >
+      llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /models/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf
+      --jinja -c 8192
+
+  # Chat. Use it with: voice-notes --chat-model qwen-reasoner
+  qwen-reasoner:
+    ttl: 600
+    cmd: >
+      llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /models/Qwen3-14B-Q4_K_M.gguf
+      --jinja -c 8192
+
+# Speech to text stays loaded. The chat models are too big to hold together, so they take turns:
+# asking for one unloads the other (loading takes a while, so switching between the fast and the
+# reasoning model is slow the first time). Neither unloads Whisper.
+groups:
+  speech:
+    swap: false
+    exclusive: false
+    persistent: true
+    members:
+      - "whisper"
+  chat:
+    swap: true
+    exclusive: false
+    members:
+      - "qwen3-coder-30b"
+      - "qwen-reasoner"
