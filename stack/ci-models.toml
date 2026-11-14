@@ -1,0 +1,103 @@
+# Models for the CI smoke test (ticket #8, VN-2).
+#
+# The smoke test runs one full voice turn (`voice-notes turn`) against a stack of small models,
+# so it is fast enough to gate every pull request. Field names follow the models.toml schema
+# planned in ticket #22 (id, url, sha256, size, role, size class, licence).
+#
+# Sizes and sha256 values were checked by downloading each file and comparing it with what the
+# host publishes. Licences are as stated on each model card; they were not independently audited.
+
+[meta]
+checked = "2026-11-14"
+test_clip = "What is the capital of France?"
+# The measurements below were taken on a development machine (24 threads, 125 GB RAM), with every
+# service pinned to 4 cores (`taskset -c 0-3`) and no GPU (`-ng`, `-ngl 0`, `USE_GPU=false`), to
+# imitate a 4-core runner. A real GitHub-hosted runner has NOT been measured yet; the first CI run
+# of the smoke test (#11) will tell.
+
+[[model]]
+id = "whisper-tiny.en-q5_1"
+role = "speech-to-text"
+class = "ci"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin"
+sha256 = "c77c5766f1cef09b6b7d47f21b546cbddd4157886b3b5d6d4f709e91e66c7c2b"
+size_bytes = 32166155
+licence = "MIT"
+notes = "English only. Served by whisper.cpp's whisper-server with --inference-path /v1/audio/transcriptions --convert -ng."
+chosen = true
+
+[[model]]
+id = "whisper-base.en-q5_1"
+role = "speech-to-text"
+class = "ci"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin"
+sha256 = "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f"
+size_bytes = 59721011
+licence = "MIT"
+notes = "Fallback if the tiny model ever mishears the test clip. Downloaded and verified, but not measured."
+chosen = false
+
+[[model]]
+id = "qwen3-0.6b-q4_k_m"
+role = "chat"
+class = "ci"
+url = "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+sha256 = "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"
+size_bytes = 396705472
+licence = "Apache-2.0"
+notes = "Served by llama-server with --jinja -c 2048 so the client can switch thinking off. Under 1 GB as the ticket asks."
+chosen = true
+
+[[model]]
+id = "kokoro-v1_0"
+role = "text-to-speech"
+class = "ci"
+url = "https://huggingface.co/hexgrad/Kokoro-82M/resolve/main/kokoro-v1_0.pth"
+sha256 = "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4"
+size_bytes = 327212226
+licence = "Apache-2.0"
+notes = "Served by Kokoro-FastAPI in CPU mode. There is no smaller Kokoro; its image is the largest download in the stack."
+chosen = true
+
+# Container images the CI stack would pull. Sizes are compressed layer sizes read from the registry
+# for linux/amd64. Tags move, so the images must be pinned by digest in the compose file (#12).
+[[image]]
+name = "ghcr.io/ggml-org/llama.cpp"
+tag = "server"
+role = "chat"
+compressed_size_bytes_approx = 300000000
+notes = "CPU server image."
+
+[[image]]
+name = "ghcr.io/ggml-org/whisper.cpp"
+tag = "main"
+role = "speech-to-text"
+compressed_size_bytes_approx = 500000000
+notes = "Not yet checked: whether it contains whisper-server and ffmpeg (needed for --convert). To settle in #9."
+
+[[image]]
+name = "ghcr.io/remsky/kokoro-fastapi-cpu"
+tag = "latest"
+role = "text-to-speech"
+compressed_size_bytes_approx = 1510000000
+notes = "The largest pull, about 1.5 GB. Not yet checked: whether the model weights are baked into the image. To settle in #9."
+
+# One full turn on the pinned 4 cores, warm, three runs (milliseconds). The transcript was exactly
+# the test clip every time and the reply was correct ("The capital of France is Paris.").
+[measured.turn]
+transcribe_ms = [285, 250, 245]
+chat_ms = [212, 72, 72]
+speech_ms = [438, 391, 367]
+audio_bytes = 95178
+
+# Starting each service on this machine until it answered, in seconds.
+[measured.startup_seconds]
+whisper_tiny = 0.3
+llama_qwen_0_6b = 0.3
+kokoro_cpu = 5.2
+
+# Memory in use after a turn, in megabytes.
+[measured.resident_mb]
+whisper_tiny = 160
+llama_qwen_0_6b = 373
+kokoro_cpu = 1381
