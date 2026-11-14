@@ -65,12 +65,14 @@ jobs:
       - run: cargo deny --log-level error check
       - run: typos
 
-  # Test: cargo nextest (Linux and macOS)
+  # Test: cargo nextest (Linux, macOS on Apple Silicon, and macOS on Intel). The hardware
+  # detection reads real sysctl and system_profiler output, so it runs on both kinds of Mac.
+  # macos-15-intel is the last Intel runner GitHub offers; it goes away in 2027.
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     name: test (${{ matrix.os }})
     steps:
