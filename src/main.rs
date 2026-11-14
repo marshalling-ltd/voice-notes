@@ -68,6 +68,13 @@ enum Command {
     },
     /// List the microphones and speakers; the default and the saved choice are marked
     Devices,
+    /// Show what was found out about this machine and the size class it gets. With --raw, also
+    /// the raw output of the commands it read, to report a wrong result
+    Hardware {
+        /// Include the raw output of every command the detection read
+        #[arg(long)]
+        raw: bool,
+    },
     /// Find the models and services you already have, pick the best, and save the choices
     Setup {
         /// Save without asking
@@ -343,6 +350,12 @@ async fn main() -> Result<()> {
             }
         };
     }
+    if let Some(Command::Hardware { raw }) = args.command {
+        let machine = hardware::detect();
+        let probes = raw.then(hardware::probes);
+        print!("{}", hardware::report(&machine, probes.as_deref()));
+        return Ok(());
+    }
     if let Some(Command::Devices) = args.command {
         let config = Config::load()?;
         let input = args.input_device.as_ref().or(config.input_device.as_ref());
@@ -435,6 +448,18 @@ mod tests {
             from_flags.speech.output_device.as_deref(),
             Some("flag-speaker")
         );
+    }
+
+    #[test]
+    fn the_hardware_command_takes_an_optional_raw_flag() {
+        assert!(matches!(
+            args(&["hardware"]).command,
+            Some(Command::Hardware { raw: false })
+        ));
+        assert!(matches!(
+            args(&["hardware", "--raw"]).command,
+            Some(Command::Hardware { raw: true })
+        ));
     }
 
     /// The device flags work after a subcommand too, like the other global flags.

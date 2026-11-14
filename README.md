@@ -147,7 +147,7 @@ The one exception you can switch on is the **Claude backend** (the `claude` prof
 It reports:
 
 - **What it found:** the Whisper and chat models on the server, a Kokoro endpoint, the system voice, a player, the `claude` CLI, and which profiles that makes possible.
-- **Your machine:** OS, cores, RAM, GPU and free disk. Memory available to models is a card's VRAM (NVIDIA, or discrete AMD), the shared pool for Apple Silicon and AMD APUs (read from the kernel's `amdgpu` files on Linux), or half the RAM when there is no GPU.
+- **Your machine:** OS, cores, RAM, GPU and free disk. Memory available to models is a card's VRAM (NVIDIA, or discrete AMD), the shared pool for Apple Silicon (70% of the unified memory) and AMD APUs (read from the kernel's `amdgpu` files on Linux), or half the RAM when there is no GPU. On an Intel Mac a discrete card counts by its own memory (read from `system_profiler`), while Intel graphics share system memory like the CPU and count as no GPU. Cards report slightly less than their nominal size (a "24 GB" card shows 24 564 MiB), so memory is counted 2% generously and each card gets the class on its box. An Intel build running under Rosetta on an Apple Silicon Mac is recognised as Apple Silicon.
 - **Speed:** it times a short clip through Whisper, a two-sentence reply from the chat model (cold, then warm, so you can see when a model had to load first), from the reasoning model, and one sentence from Kokoro, and rates each for conversation. Time to the first sentence is what matters: up to 1.5 s feels instant, up to 4 s is fine, beyond that is too slow for talking.
 - **What would help:** missing pieces, and a chat model that is too slow here, come with a suggestion sized for your machine:
 
@@ -159,6 +159,8 @@ It reports:
 | 24 GB or more (power) | large-v3-turbo | Qwen3-Coder-30B-A3B | Qwen3.8-27B, the reasoning model for `smart` and `think` |
 
 The sizes are those of the real files in `models.toml`. If the installed chat model is slower than your machine warrants, the suggestion is the model that fits (or the next size down if you are already there). The suggested models can be downloaded from the app: see *Choosing models* below, or the models screen (`m`).
+
+`voice-notes hardware` prints what was found about this machine, the memory models can use and the rule that gave it, and the size class; `voice-notes hardware --raw` adds the raw output of every command the detection read (`sysctl`, `system_profiler`, `nvidia-smi`, `lspci`, `/proc/meminfo`, `df`), which is what to include when reporting a wrong result.
 
 **Choosing models.** On the setup screen press `c` to pick the model for each job: chat (the `fast` and `dev` profiles), smart (the `smart` and `think` profiles) and speech-to-text. Each row starts on the recommended model; `↑↓` moves between jobs, `←→` steps through the models your server offers (embedding, vision and speech models are never offered as chat models), Enter accepts and Esc cancels. For example, swap the coder model for the reasoning model as your chat model, then press Enter on the setup screen to save. A saved choice is used straight away, for all three jobs, without restarting the app. Your server loads a model the first time it is used, so the first reply after a change can be slow. The same screen is reachable later with `u`.
 
