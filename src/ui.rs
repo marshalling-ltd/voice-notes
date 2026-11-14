@@ -23,7 +23,7 @@ use crate::devices::{self, DeviceInfo, Direction};
 use crate::download::{self, Phase as DownloadPhase};
 use crate::endpoints::Endpoints;
 use crate::hardware::{Tier, gib};
-use crate::modelscreen::{ActiveDownload, InstallState, ModelsAction, ModelsScreen};
+use crate::modelscreen::{ActiveDownload, InstallState, ModelsAction, ModelsScreen, PendingModel};
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
 use crate::setup::{self, Choice, Findings};
 use crate::speech::{SentenceSplitter, Speaker};
@@ -672,7 +672,9 @@ impl App {
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc => self.models = None,
+            // Escape closes the screen, unless it is answering the licence question: then it
+            // means "no" and the list stays.
+            KeyCode::Esc if !screen.confirming() => self.models = None,
             _ => {
                 return screen.on_key(key).map(|action| match action {
                     ModelsAction::Download(ids) => Action::StartDownloads(ids),
@@ -1344,6 +1346,56 @@ fn models_row_line(screen: &ModelsScreen, index: usize, width: usize) -> Line<'s
     ])
 }
 
+/// The licence question: each model about to be downloaded with its licence and where to read
+/// it, and the total. Shown before every download.
+fn licence_lines(pending: &[PendingModel], width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            fit(
+                "Downloading these models means accepting their licences.",
+                width,
+            ),
+            Style::new().fg(Color::White),
+        )),
+        Line::default(),
+    ];
+    for item in pending {
+        let model = &item.model;
+        lines.push(Line::from(vec![
+            Span::styled(
+                fit(&model.name, width.saturating_sub(12)),
+                Style::new().fg(GOOD).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", gib(item.remaining_bytes)),
+                Style::new().fg(DIM),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Licence  ", Style::new().fg(DIM)),
+            Span::raw(fit(&model.licence, width.saturating_sub(11))),
+        ]));
+        // The link gets a line of its own: the longest ones are over 70 characters.
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                fit(
+                    model.licence_url.as_deref().unwrap_or("(no link given)"),
+                    width.saturating_sub(2)
+                )
+            ),
+            Style::new().fg(ACCENT),
+        )));
+        lines.push(Line::default());
+    }
+    let total: u64 = pending.iter().map(|p| p.remaining_bytes).sum();
+    lines.push(Line::from(Span::styled(
+        format!("To download: {}", gib(total)),
+        Style::new().fg(DIM),
+    )));
+    lines
+}
+
 /// Everything above the download status: the machine, the classes, the models, and the details
 /// of the highlighted one (its licence is shown before anything is downloaded).
 fn models_text(screen: &ModelsScreen, width: usize) -> Vec<Line<'static>> {
@@ -1444,15 +1496,21 @@ fn draw_models(frame: &mut Frame, screen: &ModelsScreen, notice: Option<&str>) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let block = panel("Voice Notes · Models");
+    let block = panel(if screen.confirming() {
+        "Voice Notes · Models · Licences"
+    } else {
+        "Voice Notes · Models"
+    });
     let inner = block.inner(body);
     frame.render_widget(block, body);
+    let width = usize::from(inner.width);
     let [text, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(inner);
-    frame.render_widget(
-        Paragraph::new(models_text(screen, usize::from(inner.width))),
-        text,
-    );
-    draw_models_status(frame, status, screen);
+    if let Some(pending) = &screen.pending {
+        frame.render_widget(Paragraph::new(licence_lines(pending, width)), inner);
+    } else {
+        frame.render_widget(Paragraph::new(models_text(screen, width)), text);
+        draw_models_status(frame, status, screen);
+    }
     if let Some(notice) = notice {
         let line = fit(
             &format!("⚠ {notice}"),
@@ -1471,14 +1529,22 @@ fn draw_models(frame: &mut Frame, screen: &ModelsScreen, notice: Option<&str>) {
     } else {
         ("Esc", " close")
     };
-    let keys = [
-        ("Enter", " download"),
-        ("a", " all"),
-        ("←→", " class"),
-        ("↑↓", " row"),
-        stop_or_close,
-        ("q", " quit"),
-    ];
+    let keys = if screen.confirming() {
+        vec![
+            ("Enter", " accept and download"),
+            ("Esc", " cancel"),
+            ("q", " quit"),
+        ]
+    } else {
+        vec![
+            ("Enter", " download"),
+            ("a", " all"),
+            ("←→", " class"),
+            ("↑↓", " row"),
+            stop_or_close,
+            ("q", " quit"),
+        ]
+    };
     frame.render_widget(Paragraph::new(hint_line(&keys)), footer);
 }
 
@@ -4282,11 +4348,16 @@ mod models_tests {
     }
 
     #[test]
-    fn the_screens_requests_become_program_actions() {
+    fn the_screens_requests_become_program_actions_once_the_licences_are_accepted() {
         let folder = Folder::new("actions");
         let mut app = app_with(screen_in(&folder, Some(Tier::Minimal)));
         assert_eq!(
             app.on_key(press(KeyCode::Char('a'))),
+            None,
+            "a asks, it does not download"
+        );
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('y'))),
             Some(Action::StartDownloads(vec![
                 "whisper-small".into(),
                 "qwen3-4b".into(),
@@ -4294,9 +4365,11 @@ mod models_tests {
             ]))
         );
         assert_eq!(app.on_key(press(KeyCode::Down)), None);
+        assert_eq!(app.on_key(press(KeyCode::Enter)), None, "Enter asks first");
         assert_eq!(
             app.on_key(press(KeyCode::Enter)),
-            Some(Action::StartDownloads(vec!["qwen3-4b".into()]))
+            Some(Action::StartDownloads(vec!["qwen3-4b".into()])),
+            "and the second Enter accepts"
         );
         app.models.as_mut().unwrap().active =
             Some(downloading("qwen3-4b", 1, 2, DownloadPhase::Downloading, 0));
@@ -4304,6 +4377,173 @@ mod models_tests {
             app.on_key(press(KeyCode::Char('x'))),
             Some(Action::CancelDownload)
         );
+    }
+
+    // ---- the licence question
+
+    #[test]
+    fn the_question_shows_each_models_licence_name_and_link() {
+        let folder = Folder::new("licences");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Minimal)));
+        app.on_key(press(KeyCode::Char('a')));
+        let rows = render(&app);
+        let text = rows.join("\n");
+        for expected in [
+            "Models · Licences",
+            "Downloading these models means accepting their licences.",
+            "Whisper small",
+            "Qwen3 4B (Q4_K_M)",
+            "Kokoro v1.0 voice model",
+            "Licence  MIT",
+            "Licence  Apache-2.0",
+            "  https://github.com/openai/whisper/blob/main/LICENSE",
+            "  https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE",
+            "  https://huggingface.co/hexgrad/Kokoro-82M",
+            "To download: 3.1 GB", // 488 MB + 2.5 GB + 327 MB, as the catalogue says
+        ] {
+            assert!(text.contains(expected), "{expected:?} missing in:\n{text}");
+        }
+        for hint in ["Enter accept and download", "Esc cancel", "q quit"] {
+            assert!(rows[23].contains(hint), "{hint} missing in {:?}", rows[23]);
+        }
+        assert!(
+            !text.contains("not installed"),
+            "the list is replaced by the question"
+        );
+    }
+
+    /// Every licence link in the catalogue is shown in full at 80 columns: a cut-off link is of
+    /// no use to someone who wants to read the licence.
+    #[test]
+    fn every_catalogue_link_fits_the_question_in_full() {
+        let folder = Folder::new("links");
+        for model in Catalogue::builtin().models() {
+            let mut screen = screen_in(&folder, Some(Tier::Power));
+            screen.pending = Some(vec![PendingModel {
+                model: model.clone(),
+                remaining_bytes: model.size_bytes,
+            }]);
+            let text = render(&app_with(screen)).join("\n");
+            let link = model.licence_url.as_deref().unwrap();
+            assert!(
+                text.contains(link),
+                "{}: {link} was cut off in:\n{text}",
+                model.id
+            );
+            assert!(text.contains(&model.licence), "{}", model.id);
+        }
+    }
+
+    #[test]
+    fn the_largest_question_fits_the_screen() {
+        let folder = Folder::new("largest");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Power)));
+        app.on_key(press(KeyCode::Char('a')));
+        let rows = render(&app);
+        let text = rows.join("\n");
+        for name in [
+            "Whisper large-v3-turbo",
+            "Qwen3-Coder 30B-A3B",
+            "Qwen3 14B",
+            "Kokoro",
+        ] {
+            assert!(text.contains(name), "{name} missing in:\n{text}");
+        }
+        let total: u64 = Catalogue::builtin()
+            .set(Tier::Power)
+            .models()
+            .iter()
+            .map(|m| m.size_bytes)
+            .sum();
+        assert!(
+            text.contains(&format!("To download: {}", gib(total))),
+            "{text}"
+        );
+        assert!(rows.iter().all(|r| r.chars().count() <= 80));
+    }
+
+    #[test]
+    fn the_question_counts_only_what_is_still_to_download() {
+        let folder = Folder::new("remaining");
+        let eight = Catalogue::builtin().model("qwen3-8b").unwrap();
+        folder.put(&format!("{}.part", eight.file_name()), eight.size_bytes / 2);
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Enter));
+        let text = text(&app);
+        assert!(
+            text.contains("To download: 2.3 GB"),
+            "half of 4.7 GB is kept:\n{text}"
+        );
+    }
+
+    /// Escape answers "no" while the question is open, and only then closes the screen.
+    #[test]
+    fn escape_declines_first_and_closes_the_screen_second() {
+        let folder = Folder::new("escape");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.models.as_ref().unwrap().confirming());
+        assert_eq!(app.on_key(press(KeyCode::Esc)), None, "no download");
+        let screen = app.models.as_ref().expect("the screen is still open");
+        assert!(!screen.confirming());
+        assert!(text(&app).contains("not installed"), "the list is back");
+        assert_eq!(app.on_key(press(KeyCode::Esc)), None);
+        assert!(app.models.is_none(), "a second Escape closes the screen");
+    }
+
+    #[test]
+    fn n_declines_and_q_still_quits_from_the_question() {
+        let folder = Folder::new("quit");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.on_key(press(KeyCode::Char('n'))), None);
+        assert!(app.models.as_ref().is_some_and(|s| !s.confirming()));
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Char('q')));
+        assert!(app.quit);
+    }
+
+    /// Nothing reaches the program (`Session`) as a download until the question is accepted.
+    #[test]
+    fn no_key_but_accept_can_start_a_download() {
+        let folder = Folder::new("only-accept");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Power)));
+        let mut actions = vec![app.on_key(press(KeyCode::Char('a')))];
+        for code in [
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::Char('a'),
+            KeyCode::Char('x'),
+            KeyCode::Tab,
+            KeyCode::Char('d'),
+            KeyCode::Char('m'),
+            KeyCode::Char('t'),
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+        ] {
+            actions.push(app.on_key(press(code)));
+        }
+        assert!(actions.iter().all(Option::is_none), "{actions:?}");
+    }
+
+    #[test]
+    fn a_warning_is_visible_on_the_question_screen_too() {
+        let folder = Folder::new("question-warning");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        app.on_key(press(KeyCode::Enter));
+        app.notice = Some("something earlier".into());
+        assert!(render(&app)[22].contains("⚠ something earlier"));
+    }
+
+    #[test]
+    fn the_question_does_not_panic_on_small_terminals() {
+        let folder = Folder::new("question-small");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Power)));
+        app.on_key(press(KeyCode::Char('a')));
+        for (w, h) in [(40, 10), (20, 5), (80, 8), (120, 40), (1, 1)] {
+            let _ = render_sized(&app, w, h);
+        }
     }
 
     // ---- drawing, at 80 by 24

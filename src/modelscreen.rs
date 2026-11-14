@@ -56,6 +56,14 @@ pub struct ActiveDownload {
     pub waiting: usize,
 }
 
+/// A model about to be downloaded, waiting for the user to accept its licence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingModel {
+    pub model: Model,
+    /// How many bytes this download has to fetch (less than the size if part is already kept).
+    pub remaining_bytes: u64,
+}
+
 /// What the screen asks the program to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelsAction {
@@ -78,6 +86,9 @@ pub struct ModelsScreen {
     /// The highlighted row.
     pub focus: usize,
     pub active: Option<ActiveDownload>,
+    /// The models the user asked to download. While this is set the screen shows their licences,
+    /// and nothing is downloaded until the user accepts.
+    pub pending: Option<Vec<PendingModel>>,
     dir: PathBuf,
 }
 
@@ -93,6 +104,7 @@ impl ModelsScreen {
             rows: Vec::new(),
             focus: 0,
             active: None,
+            pending: None,
             dir,
         };
         screen.refresh();
@@ -152,10 +164,20 @@ impl ModelsScreen {
         self.active.is_some()
     }
 
-    /// Handle a key. Closing the screen and quitting are left to the caller.
+    /// Whether the licences of the models to download are being shown for the user to accept.
+    #[must_use]
+    pub fn confirming(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Handle a key. Quitting, and closing the screen when no question is open, are left to the
+    /// caller.
     pub fn on_key(&mut self, key: KeyEvent) -> Option<ModelsAction> {
         if key.kind != KeyEventKind::Press {
             return None;
+        }
+        if self.pending.is_some() {
+            return self.on_confirm_key(key);
         }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.focus = self.focus.saturating_sub(1),
@@ -164,36 +186,68 @@ impl ModelsScreen {
             }
             KeyCode::Left | KeyCode::Char('h') => self.change_class(-1),
             KeyCode::Right | KeyCode::Char('l') => self.change_class(1),
-            KeyCode::Enter => return self.download_focused(),
-            KeyCode::Char('a') => return self.download_missing(),
+            KeyCode::Enter => self.ask_focused(),
+            KeyCode::Char('a') => self.ask_missing(),
             KeyCode::Char('x') => return self.active.is_some().then_some(ModelsAction::Cancel),
             _ => {}
         }
         None
     }
 
-    /// Download the highlighted model, unless it is there already or another download is running.
-    fn download_focused(&self) -> Option<ModelsAction> {
+    /// Ask to download the highlighted model, unless it is there already or another download is
+    /// running. The licence is shown first; nothing is downloaded yet.
+    fn ask_focused(&mut self) {
         if self.busy() {
-            return None;
+            return;
         }
-        let row = self.rows.get(self.focus)?;
-        (row.state != InstallState::Installed)
-            .then(|| ModelsAction::Download(vec![row.model.id.clone()]))
+        self.ask(&[self.focus]);
     }
 
-    /// Download everything of the viewed class that is not there yet.
-    fn download_missing(&self) -> Option<ModelsAction> {
+    /// Ask to download everything of the viewed class that is not there yet.
+    fn ask_missing(&mut self) {
         if self.busy() {
-            return None;
+            return;
         }
-        let ids: Vec<String> = self
-            .rows
+        let wanted: Vec<usize> = (0..self.rows.len()).collect();
+        self.ask(&wanted);
+    }
+
+    /// Show the licences of these rows (those not installed yet), if there are any.
+    fn ask(&mut self, wanted: &[usize]) {
+        let pending: Vec<PendingModel> = wanted
             .iter()
-            .filter(|r| r.state != InstallState::Installed)
-            .map(|r| r.model.id.clone())
+            .filter_map(|&i| self.rows.get(i))
+            .filter(|row| row.state != InstallState::Installed)
+            .map(|row| PendingModel {
+                model: row.model.clone(),
+                remaining_bytes: match row.state {
+                    InstallState::Partial { have } => row.model.size_bytes - have,
+                    _ => row.model.size_bytes,
+                },
+            })
             .collect();
-        (!ids.is_empty()).then_some(ModelsAction::Download(ids))
+        self.pending = (!pending.is_empty()).then_some(pending);
+    }
+
+    /// Keys while the licences are shown: accept, or decline. Nothing else does anything, so
+    /// the list behind the question cannot change under it.
+    fn on_confirm_key(&mut self, key: KeyEvent) -> Option<ModelsAction> {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                let ids = self
+                    .pending
+                    .take()?
+                    .into_iter()
+                    .map(|p| p.model.id)
+                    .collect();
+                Some(ModelsAction::Download(ids))
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                self.pending = None;
+                None
+            }
+            _ => None,
+        }
     }
 }
 
@@ -399,36 +453,103 @@ mod tests {
         assert_eq!(s.focus, 2);
     }
 
-    // ---- downloading
+    // ---- asking, and the licences
+
+    fn ids(pending: &[PendingModel]) -> Vec<&str> {
+        pending.iter().map(|p| p.model.id.as_str()).collect()
+    }
 
     #[test]
-    fn enter_downloads_the_highlighted_model() {
+    fn enter_asks_about_the_highlighted_model_but_downloads_nothing() {
         let folder = Folder::new("enter");
         let mut s = screen(&folder, Tier::Minimal);
         s.on_key(press(KeyCode::Down));
         assert_eq!(
             s.on_key(press(KeyCode::Enter)),
-            Some(ModelsAction::Download(vec!["qwen3-4b".into()]))
+            None,
+            "nothing is downloaded yet"
         );
+        assert!(s.confirming());
+        assert_eq!(ids(s.pending.as_ref().unwrap()), ["qwen3-4b"]);
     }
 
     #[test]
-    fn enter_does_nothing_for_a_model_that_is_already_there() {
-        let folder = Folder::new("enter-installed");
-        let small = model("whisper-small");
-        folder.put(small.file_name(), small.size_bytes);
+    fn accepting_starts_the_download() {
+        let folder = Folder::new("accept");
+        for accept in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('Y')] {
+            let mut s = screen(&folder, Tier::Minimal);
+            s.on_key(press(KeyCode::Down));
+            s.on_key(press(KeyCode::Enter));
+            assert_eq!(
+                s.on_key(press(accept)),
+                Some(ModelsAction::Download(vec!["qwen3-4b".into()])),
+                "{accept:?}"
+            );
+            assert!(!s.confirming(), "the question is closed once answered");
+        }
+    }
+
+    #[test]
+    fn declining_downloads_nothing_and_leaves_the_list_as_it_was() {
+        let folder = Folder::new("decline");
+        for decline in [KeyCode::Esc, KeyCode::Char('n'), KeyCode::Char('N')] {
+            let mut s = screen(&folder, Tier::Minimal);
+            s.on_key(press(KeyCode::Down));
+            s.on_key(press(KeyCode::Enter));
+            assert_eq!(s.on_key(press(decline)), None, "{decline:?}");
+            assert!(!s.confirming());
+            assert_eq!((s.focus, s.viewing), (1, Tier::Minimal));
+            // And it can be asked again.
+            s.on_key(press(KeyCode::Enter));
+            assert!(s.confirming(), "declining once does not block asking again");
+        }
+    }
+
+    /// While the licences are on screen no other key may change the list or start anything.
+    #[test]
+    fn other_keys_do_nothing_while_the_licences_are_shown() {
+        let folder = Folder::new("frozen");
+        let mut s = screen(&folder, Tier::Light);
+        s.on_key(press(KeyCode::Char('a')));
+        let before = s.clone();
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('a'),
+            KeyCode::Char('x'),
+            KeyCode::Char('z'),
+            KeyCode::Tab,
+            KeyCode::Char('j'),
+            KeyCode::Char('h'),
+        ] {
+            assert_eq!(s.on_key(press(code)), None, "{code:?}");
+        }
+        assert_eq!(s, before, "nothing changed");
+    }
+
+    #[test]
+    fn key_releases_do_not_answer_the_question() {
+        let folder = Folder::new("release");
         let mut s = screen(&folder, Tier::Minimal);
-        assert_eq!(s.on_key(press(KeyCode::Enter)), None);
+        s.on_key(press(KeyCode::Enter));
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+        assert_eq!(s.on_key(release), None);
+        assert!(s.confirming(), "a release is not an acceptance");
     }
 
     #[test]
-    fn enter_continues_a_partial_download() {
+    fn enter_on_a_partial_download_asks_and_counts_only_what_is_left() {
         let folder = Folder::new("enter-partial");
-        folder.put(
-            &format!("{}.part", model("whisper-small").file_name()),
-            4096,
-        );
+        let small = model("whisper-small");
+        folder.put(&format!("{}.part", small.file_name()), 4096);
         let mut s = screen(&folder, Tier::Minimal);
+        s.on_key(press(KeyCode::Enter));
+        let pending = s.pending.as_ref().unwrap();
+        assert_eq!(ids(pending), ["whisper-small"]);
+        assert_eq!(pending[0].remaining_bytes, small.size_bytes - 4096);
         assert_eq!(
             s.on_key(press(KeyCode::Enter)),
             Some(ModelsAction::Download(vec!["whisper-small".into()]))
@@ -436,13 +557,19 @@ mod tests {
     }
 
     #[test]
-    fn a_downloads_everything_that_is_missing_in_order_and_nothing_else() {
+    fn a_asks_about_everything_missing_in_order_and_nothing_else() {
         let folder = Folder::new("all");
         let small = model("whisper-small");
         folder.put(small.file_name(), small.size_bytes);
         let mut s = screen(&folder, Tier::Minimal);
+        assert_eq!(s.on_key(press(KeyCode::Char('a'))), None);
         assert_eq!(
-            s.on_key(press(KeyCode::Char('a'))),
+            ids(s.pending.as_ref().unwrap()),
+            ["qwen3-4b", "kokoro-v1_0"],
+            "the installed one is not asked about"
+        );
+        assert_eq!(
+            s.on_key(press(KeyCode::Enter)),
             Some(ModelsAction::Download(vec![
                 "qwen3-4b".into(),
                 "kokoro-v1_0".into()
@@ -451,18 +578,52 @@ mod tests {
     }
 
     #[test]
-    fn a_has_nothing_to_do_when_everything_is_installed() {
+    fn every_pending_model_carries_its_licence() {
+        let folder = Folder::new("licences");
+        let mut s = screen(&folder, Tier::Power);
+        s.on_key(press(KeyCode::Char('a')));
+        let pending = s.pending.as_ref().unwrap();
+        assert_eq!(pending.len(), 4);
+        for p in pending {
+            assert!(!p.model.licence.is_empty(), "{}", p.model.id);
+            assert!(
+                p.model
+                    .licence_url
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with("https://")),
+                "{}",
+                p.model.id
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_asked_about_a_model_that_is_already_there() {
+        let folder = Folder::new("enter-installed");
+        let small = model("whisper-small");
+        folder.put(small.file_name(), small.size_bytes);
+        let mut s = screen(&folder, Tier::Minimal);
+        assert_eq!(s.on_key(press(KeyCode::Enter)), None);
+        assert!(
+            !s.confirming(),
+            "there is nothing to download, so no licence to accept"
+        );
+    }
+
+    #[test]
+    fn a_has_nothing_to_ask_when_everything_is_installed() {
         let folder = Folder::new("all-done");
         for row in &screen(&folder, Tier::Minimal).rows {
             folder.put(row.model.file_name(), row.model.size_bytes);
         }
         let mut s = screen(&folder, Tier::Minimal);
         assert_eq!(s.on_key(press(KeyCode::Char('a'))), None);
+        assert!(!s.confirming());
         assert_eq!(s.bytes_to_download(), 0);
     }
 
     #[test]
-    fn only_one_download_runs_at_a_time() {
+    fn nothing_is_asked_while_a_download_is_running() {
         let folder = Folder::new("busy");
         let mut s = screen(&folder, Tier::Minimal);
         s.active = Some(ActiveDownload {
@@ -473,6 +634,7 @@ mod tests {
         assert!(s.busy());
         assert_eq!(s.on_key(press(KeyCode::Enter)), None);
         assert_eq!(s.on_key(press(KeyCode::Char('a'))), None);
+        assert!(!s.confirming());
     }
 
     #[test]
