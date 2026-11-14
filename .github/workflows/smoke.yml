@@ -31,6 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Fast, no Docker: the stack's configuration is consistent, and every image in compose.yaml
+      # is pinned by digest (a tag alone could change what this test runs).
+      - name: Check the stack configuration
+        run: |
+          python3 -m unittest discover -s stack
+          python3 stack/pin_images.py --check
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
       - name: Install Rust toolchain
         run: |
           rustup toolchain install nightly --profile minimal

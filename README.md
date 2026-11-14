@@ -209,7 +209,7 @@ If nothing appears while you speak, run `cargo run -- --plain --verbose` and com
    make check          # cargo update/upgrade, machete, audit, deny, typos, fmt, clippy pedantic, tests
    ```
 
-3. Branch off `upstream/master`, make a focused change with tests, **run `make check` before every push**, push to your fork and open a pull request against `master`. CI runs the same checks on Linux and macOS and must pass. A smoke test also runs the whole voice loop against the service stack in `stack/` (see `stack/README.md`); you can run it yourself with `cargo build && stack/smoke.sh` if Docker is available.
+3. Branch off `upstream/master`, make a focused change with tests, **run `make check` before every push**, push to your fork and open a pull request against `master`. CI runs the same checks on Linux and macOS and must pass. A smoke test also runs the whole voice loop against the service stack in `stack/` (see `stack/README.md`); you can run it yourself with `cargo build && stack/smoke.sh` if Docker is available. The container images in `stack/compose.yaml` are pinned by digest; changing one is a pull request that must pass that smoke test (see `stack/README.md`).
 
 Other targets: `make test`, `make nextest`, `make test-cov`, `make clean`.
 

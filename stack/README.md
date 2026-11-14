@@ -15,8 +15,8 @@ docker compose -f stack/compose.yaml down -v        # stop and delete the downlo
 | Service | Image | Address | Serves |
 | --- | --- | --- | --- |
 | `models` | the llama-swap image | none | One-shot job: downloads the models in `ci-models.toml` into the `models` volume and checks their size and sha256. Does nothing if they are already there. |
-| `llama-swap` | `ghcr.io/mostlygeek/llama-swap:unified-vulkan` | `127.0.0.1:8080` | Chat (`/v1/chat/completions`), the model list (`/v1/models`) and speech to text (`/v1/audio/transcriptions`). It starts llama.cpp or whisper.cpp when a request names the model, and stops them when idle. Both models stay loaded together (see `groups` in `llama-swap.yaml`). |
-| `kokoro` | `ghcr.io/remsky/kokoro-fastapi-cpu:v0.10.0` | `127.0.0.1:8880` | Text to speech (`/v1/audio/speech`). The model weights are part of the image. |
+| `llama-swap` | `ghcr.io/mostlygeek/llama-swap:unified-vulkan` (pinned) | `127.0.0.1:8080` | Chat (`/v1/chat/completions`), the model list (`/v1/models`) and speech to text (`/v1/audio/transcriptions`). It starts llama.cpp or whisper.cpp when a request names the model, and stops them when idle. Both models stay loaded together (see `groups` in `llama-swap.yaml`). |
+| `kokoro` | `ghcr.io/remsky/kokoro-fastapi-cpu:v0.10.0` (pinned) | `127.0.0.1:8880` | Text to speech (`/v1/audio/speech`). The model weights are part of the image. |
 
 These are the addresses the client uses by default. The default model set is the small one chosen for CI (`ci-models.toml`): Whisper tiny.en, Qwen3-0.6B and Kokoro.
 
@@ -38,8 +38,8 @@ Set these in the environment or in a `stack/.env` file.
 | `STACK_BIND` | `127.0.0.1` | Address the ports are published on. See the security notes before changing it. |
 | `LLAMA_SWAP_PORT` | `8080` | Host port for chat and speech to text. |
 | `KOKORO_PORT` | `8880` | Host port for text to speech. |
-| `KOKORO_VERSION` | `v0.10.0` | Kokoro image tag. |
-| `LLAMA_SWAP_IMAGE` | `ghcr.io/mostlygeek/llama-swap:unified-vulkan` | llama-swap image. |
+| `KOKORO_IMAGE` | the pinned Kokoro image | Kokoro image, as `name:tag@sha256:digest`. |
+| `LLAMA_SWAP_IMAGE` | the pinned llama-swap image | llama-swap image, as `name:tag@sha256:digest`. |
 | `MODELS_FILE` | `./ci-models.toml` | The models to download. |
 | `LLAMA_SWAP_CONFIG_FILE` | `./llama-swap.yaml` | The llama-swap configuration. It must match the models file, since it names the files to load. |
 
@@ -71,8 +71,29 @@ Two settings in `llama-swap.yaml` exist because the stack hit the problems they 
 ## Limits for now
 
 - CPU only. The `unified-vulkan` image can use a GPU through Vulkan, but passing the device through is not set up here.
-- Images are pinned by tag, not by digest, so they can change under the same tag. Digest pinning is ticket #12.
 - To use other models, point `MODELS_FILE` at another file and edit `llama-swap.yaml` to match. Ready-made sets per machine size are ticket #10.
+
+## Images
+
+Both images are pinned by digest in `compose.yaml`, written as `name:tag@sha256:digest`. A tag such as `unified-vulkan` can be moved to a different image at any time, which would change what the stack and CI run without anyone changing this repository. A digest names exactly one image, and Docker refuses a digest that does not exist instead of falling back to the tag. The tag stays in the reference so people can read which version it is.
+
+**Mirror, not build.** We use the upstream images as they are. Upstream already publishes them on `ghcr.io`, and building our own would mean maintaining builds of llama.cpp, whisper.cpp and Kokoro for no benefit. When we want independence from upstream (it deleting or rewriting an image), we copy the pinned images to our own namespace instead, see below.
+
+**Policy: changing an image is a pull request that must pass the smoke test.**
+
+1. Run `python3 stack/pin_images.py --update`. It asks the registry for the digest each tag points to now and rewrites `compose.yaml`. To move to a new version, change the tag first (for example Kokoro's `v0.10.0`), then run it.
+2. Review `git diff` and open a pull request. The smoke test runs on every pull request, pulls the new images and runs a full voice turn, and it must pass before the change is merged.
+3. A pull request that adds an image without a digest fails the first step of the smoke workflow (`pin_images.py --check`, which also runs in the unit tests).
+
+`pin_images.py --list` shows every image and whether it is pinned.
+
+**Mirroring.** The `Mirror images` workflow (`.github/workflows/mirror-images.yml`, started by hand from the Actions tab) copies each pinned image to `ghcr.io/<owner>/voice-notes-images/<name>:<tag>`, registry to registry, so the multi-architecture manifest and the digest stay the same. It fails if a copy ends up with a different digest. To run the stack from the mirror:
+
+```sh
+LLAMA_SWAP_IMAGE=ghcr.io/<owner>/voice-notes-images/llama-swap@sha256:<digest from compose.yaml> \
+KOKORO_IMAGE=ghcr.io/<owner>/voice-notes-images/kokoro-fastapi-cpu@sha256:<digest from compose.yaml> \
+docker compose -f stack/compose.yaml up --wait
+```
 
 ## Smoke test
 
@@ -101,5 +122,6 @@ CI runs it two ways:
 ## Checks
 
 ```sh
-python3 -m unittest discover -s stack     # the model downloader, and that the llama-swap configs match their catalogues
+python3 -m unittest discover -s stack     # the model downloader, the image pinning, and that the llama-swap configs match their catalogues
+python3 stack/pin_images.py --check       # every image is pinned by digest
 ```
