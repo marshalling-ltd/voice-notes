@@ -22,6 +22,8 @@
 #   OUT_DIR               where results and logs go           (default: smoke-out)
 #   WAIT_TIMEOUT          seconds to wait for the stack       (default: 900)
 #   KEEP_STACK            if set, leave the stack running afterwards
+#   STACK_NATIVE          if set, test the native macOS stack (macos.sh) instead of containers;
+#                         the profile's models are installed and run without Docker
 #   STACK_GPU             if set, also pass the GPU through to llama-swap (compose.gpu.yaml)
 
 set -euo pipefail
@@ -46,6 +48,10 @@ say() { printf 'smoke: %s\n' "$*"; }
 fail() { printf 'smoke: FAIL: %s\n' "$*" >&2; exit 1; }
 
 collect_logs() {
+  if [[ -n "${STACK_NATIVE:-}" ]]; then
+    cp "${VOICE_NOTES_STACK_HOME:-$HOME/.local/share/voice-notes-stack}"/run/*.log "$OUT/" 2>/dev/null || true
+    return
+  fi
   "${compose[@]}" ps -a >"$OUT/compose-ps.txt" 2>&1 || true
   "${compose[@]}" logs --no-color >"$OUT/compose-logs.txt" 2>&1 || true
 }
@@ -57,7 +63,11 @@ cleanup() {
     collect_logs
   fi
   if [[ -z "${KEEP_STACK:-}" ]]; then
-    "${compose[@]}" down -v >/dev/null 2>&1 || true
+    if [[ -n "${STACK_NATIVE:-}" ]]; then
+      "$here/macos.sh" stop >/dev/null 2>&1 || true
+    else
+      "${compose[@]}" down -v >/dev/null 2>&1 || true
+    fi
   fi
   exit "$status"
 }
@@ -67,11 +77,17 @@ trap cleanup EXIT
 
 [[ -x "$VOICE_NOTES" ]] || fail "the client is not built: $VOICE_NOTES (run cargo build)"
 [[ -f "$CLIP" ]] || fail "the test recording is missing: $CLIP"
-docker info >/dev/null 2>&1 || fail "cannot talk to Docker (is the daemon running, and are you allowed to use it?)"
+if [[ -z "${STACK_NATIVE:-}" ]]; then
+  docker info >/dev/null 2>&1 || fail "cannot talk to Docker (is the daemon running, and are you allowed to use it?)"
+fi
 
 say "starting the stack (profile: ${STACK_PROFILE:-ci}; models: ${MODELS_FILE:-from the profile})"
 start=$(date +%s)
-"${compose[@]}" up -d --wait --wait-timeout "$WAIT_TIMEOUT"
+if [[ -n "${STACK_NATIVE:-}" ]]; then
+  START_TIMEOUT="$WAIT_TIMEOUT" "$here/macos.sh" start "${STACK_PROFILE:-ci}"
+else
+  "${compose[@]}" up -d --wait --wait-timeout "$WAIT_TIMEOUT"
+fi
 say "the stack is healthy after $(( $(date +%s) - start )) s"
 
 say "running one voice turn with $(basename "$CLIP")"

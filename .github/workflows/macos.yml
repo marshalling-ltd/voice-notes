@@ -1,0 +1,59 @@
+name: macOS native stack
+
+# The smoke test (smoke.yml) against the native macOS stack: stack/macos.sh installs llama.cpp,
+# builds whisper.cpp, installs llama-swap and Kokoro without containers, starts them, and the
+# client runs one full voice turn against them.
+#
+# Started by hand from the Actions tab. It installs and builds a lot (PyTorch, whisper.cpp), so
+# it takes a while and is not part of every pull request. Note that a GitHub-hosted macOS runner
+# is a virtual machine without access to the Apple GPU, so this checks that everything installs,
+# starts and answers, not that Metal is used. Kokoro runs on the CPU here for that reason.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macos (native stack, tiny models)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check the stack configuration
+        run: python3 -m unittest discover -s stack
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the client
+        run: cargo build --locked
+
+      - name: Install the stack
+        run: stack/macos.sh install
+
+      - name: Smoke test (native stack, tiny models)
+        run: STACK_NATIVE=1 stack/smoke.sh
+        env:
+          VOICE_NOTES: ${{ github.workspace }}/target/debug/voice-notes
+          KOKORO_DEVICE: cpu
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-logs
+          path: smoke-out/
+          retention-days: 14
