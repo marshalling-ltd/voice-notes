@@ -49,7 +49,7 @@ To run next to an existing stack that already uses 8080 and 8880, change the por
 
 ## What to expect
 
-Measured on a development machine (24 threads, no GPU passed to the containers), with the CI models:
+Measured on a development machine (24 threads, no GPU passed to the containers; GPU numbers are in [GPU.md](GPU.md)), with the CI models:
 
 - First `up --wait`, including downloading the 430 MB of models: about 90 seconds. Starting again with the models already in the volume: about 2 seconds.
 - A voice turn (`voice-notes turn`) once the models are loaded: about 0.65 seconds in all (transcribe 0.25 s, chat 0.07 s, speech 0.33 s). The first turn after a start also loads the models and takes a few seconds longer.
@@ -70,7 +70,7 @@ Two settings in `llama-swap.yaml` exist because the stack hit the problems they 
 
 ## Limits for now
 
-- CPU only. The `unified-vulkan` image can use a GPU through Vulkan, but passing the device through is not set up here.
+- CPU by default. A GPU can be used through Vulkan with `compose.gpu.yaml`; see [GPU.md](GPU.md) for how, what it measured, and when it is worth it.
 - To use other models, point `MODELS_FILE` at another file and edit `llama-swap.yaml` to match. Ready-made sets per machine size are ticket #10.
 
 ## Images
@@ -110,7 +110,7 @@ It passes only if all of these hold, and prints one line for each:
 - the reply was streamed (it arrived in more than one piece);
 - the speech service returned audio.
 
-If anything fails it exits non-zero, says which stage failed, and saves the result of the turn and the logs of every service in `smoke-out/` (change it with `OUT_DIR`). Settings, such as another port or model set, are listed at the top of the script. A run with the CI models takes about 20 seconds on a machine that already has the images.
+If anything fails it exits non-zero, says which stage failed, and saves the result of the turn and the logs of every service in `smoke-out/` (change it with `OUT_DIR`). Settings, such as another port, a model set, or `STACK_GPU=1` to pass the GPU through, are listed at the top of the script. A run with the CI models takes about 20 seconds on a machine that already has the images.
 
 CI runs it two ways:
 

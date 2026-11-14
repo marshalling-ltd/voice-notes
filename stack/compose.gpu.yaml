@@ -1,0 +1,14 @@
+# Optional: lets llama-swap (llama.cpp and whisper.cpp) use the machine's GPU through Vulkan.
+#
+#   docker compose -f stack/compose.yaml -f stack/compose.gpu.yaml up --wait
+#
+# It passes the GPU device nodes into the container. Without this file the stack runs on the CPU,
+# which is what CI and any machine without a GPU get. See GPU.md for when this is worth it, and
+# for what it needs from the host.
+#
+# Kokoro (text to speech) is not changed: its image is a CPU build.
+
+services:
+  llama-swap:
+    devices:
+      - /dev/dri:/dev/dri
