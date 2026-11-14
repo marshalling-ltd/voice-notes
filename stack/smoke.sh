@@ -20,6 +20,7 @@
 #   OUT_DIR               where results and logs go           (default: smoke-out)
 #   WAIT_TIMEOUT          seconds to wait for the stack       (default: 900)
 #   KEEP_STACK            if set, leave the stack running afterwards
+#   STACK_GPU             if set, also pass the GPU through to llama-swap (compose.gpu.yaml)
 
 set -euo pipefail
 
@@ -35,6 +36,9 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 export LLAMA_SWAP_PORT="${LLAMA_SWAP_PORT:-8080}" KOKORO_PORT="${KOKORO_PORT:-8880}"
 
 compose=(docker compose -p "$PROJECT" -f "$here/compose.yaml")
+if [[ -n "${STACK_GPU:-}" ]]; then
+  compose+=(-f "$here/compose.gpu.yaml")
+fi
 
 say() { printf 'smoke: %s\n' "$*"; }
 fail() { printf 'smoke: FAIL: %s\n' "$*" >&2; exit 1; }

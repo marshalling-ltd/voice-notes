@@ -186,6 +186,17 @@ class FetchTests(unittest.TestCase):
             self.assertEqual(defined, members, swap_file)
             self.assertIn("swap: false", swap, swap_file)
 
+    def test_gpu_override_only_passes_the_gpu_device_to_llama_swap(self):
+        """The GPU file must stay an opt-in addition: no ports, images or models of its own."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "compose.gpu.yaml")) as f:
+            text = "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn("/dev/dri:/dev/dri", text)
+        for forbidden in ("ports:", "image:", "volumes:", "environment:", "command:"):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(text.count("llama-swap:"), 1)
+        self.assertNotIn("kokoro:", text, "Kokoro's image is a CPU build; it is left alone")
+
     def test_main_reports_missing_models(self):
         with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
             f.write('[[model]]\nid="x"\nrole="chat"\nchosen=false\n')
