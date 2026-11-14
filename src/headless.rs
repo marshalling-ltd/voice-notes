@@ -317,6 +317,7 @@ mod tests {
             min_threshold: 0.01,
             language: Some("en".into()),
             verbose: false,
+            input_device: None,
             endpoints: Endpoints {
                 stt: format!("{stt}/stt"),
                 chat: format!("{chat}/chat"),
@@ -340,6 +341,7 @@ mod tests {
                     voice: "af_heart".into(),
                 }),
                 system_voice: "en".into(),
+                output_device: None,
             },
             talk: false,
         }

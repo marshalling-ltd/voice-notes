@@ -5,12 +5,14 @@ use std::io::IsTerminal;
 mod audio;
 mod chat;
 mod config;
+mod devices;
 mod endpoints;
 mod hardware;
 mod headless;
 mod latency;
 mod pipeline;
 mod plain;
+mod playback;
 mod profile;
 mod setup;
 mod speech;
@@ -61,6 +63,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List the microphones and speakers; the default and the saved choice are marked
+    Devices,
     /// Find the models and services you already have, pick the best, and save the choices
     Setup {
         /// Save without asking
@@ -166,6 +170,16 @@ struct Args {
     #[arg(long, global = true)]
     no_speech: bool,
 
+    /// Microphone to record from: a device id or a name (see `voice-notes devices`)
+    /// [default: the saved one, else the system default]
+    #[arg(long, global = true)]
+    input_device: Option<String>,
+
+    /// Speaker to play replies on: a device id or a name [default: the saved one, else the
+    /// system default]
+    #[arg(long, global = true)]
+    output_device: Option<String>,
+
     /// Print the live input level (with --plain) so you can pick a good --threshold
     #[arg(long)]
     verbose: bool,
@@ -270,6 +284,10 @@ fn resolve_with(
         min_threshold: args.threshold,
         language: (language != "auto").then_some(language),
         verbose: args.verbose,
+        input_device: args
+            .input_device
+            .clone()
+            .or_else(|| config.input_device.clone()),
         backend,
         system_prompt: chosen.prompt,
         profile: chosen.name,
@@ -281,6 +299,10 @@ fn resolve_with(
                 model: pick(&args.tts_model, &config.tts_model, "kokoro"),
                 voice: pick(&args.tts_voice, &config.tts_voice, "af_heart"),
             }),
+            output_device: args
+                .output_device
+                .clone()
+                .or_else(|| config.output_device.clone()),
             ..SpeechConfig::system(pick(&args.voice, &config.voice, "en"))
         },
         talk: args.talk,
@@ -317,6 +339,25 @@ async fn main() -> Result<()> {
                 std::process::exit(e.stage.exit_code());
             }
         };
+    }
+    if let Some(Command::Devices) = args.command {
+        let config = Config::load()?;
+        let input = args.input_device.as_ref().or(config.input_device.as_ref());
+        let output = args
+            .output_device
+            .as_ref()
+            .or(config.output_device.as_ref());
+        for (direction, wanted) in [
+            (devices::Direction::Input, input),
+            (devices::Direction::Output, output),
+        ] {
+            let list = devices::list(direction)?;
+            print!(
+                "{}",
+                devices::render(direction, &list, wanted.map(String::as_str))
+            );
+        }
+        return Ok(());
     }
     if let Some(Command::Setup { yes, check, quick }) = args.command {
         let config = Config::load()?;
@@ -358,6 +399,49 @@ mod tests {
 
     fn settings(list: &[&str], config: &Config, claude: bool) -> Result<Settings> {
         resolve_with(&args(list), config, None, available_with(config, claude))
+    }
+
+    /// The saved devices are used when no flag is given, and a flag wins over them.
+    #[test]
+    fn audio_device_flags_beat_the_saved_choice() {
+        let saved = Config {
+            input_device: Some("saved-mic".into()),
+            output_device: Some("saved-speaker".into()),
+            ..Config::default()
+        };
+        let none = settings(&[], &Config::default(), false).unwrap();
+        assert_eq!(none.input_device, None);
+        assert_eq!(none.speech.output_device, None);
+
+        let from_config = settings(&[], &saved, false).unwrap();
+        assert_eq!(from_config.input_device.as_deref(), Some("saved-mic"));
+        assert_eq!(
+            from_config.speech.output_device.as_deref(),
+            Some("saved-speaker")
+        );
+
+        let flags = [
+            "--input-device",
+            "flag-mic",
+            "--output-device",
+            "flag-speaker",
+        ];
+        let from_flags = settings(&flags, &saved, false).unwrap();
+        assert_eq!(from_flags.input_device.as_deref(), Some("flag-mic"));
+        assert_eq!(
+            from_flags.speech.output_device.as_deref(),
+            Some("flag-speaker")
+        );
+    }
+
+    /// The device flags work after a subcommand too, like the other global flags.
+    #[test]
+    fn device_flags_are_global_and_the_devices_command_exists() {
+        let a = args(&["devices", "--input-device", "x"]);
+        assert!(matches!(a.command, Some(Command::Devices)));
+        assert_eq!(a.input_device.as_deref(), Some("x"));
+        let turn = args(&["turn", "--input-wav", "a.wav", "--output-device", "y"]);
+        assert_eq!(turn.output_device.as_deref(), Some("y"));
     }
 
     fn local(model: &str, think: bool) -> Backend {

@@ -6,11 +6,13 @@
 pub mod audio;
 pub mod chat;
 pub mod config;
+pub mod devices;
 pub mod endpoints;
 pub mod hardware;
 pub mod headless;
 pub mod latency;
 pub mod pipeline;
+pub mod playback;
 pub mod profile;
 pub mod setup;
 pub mod speech;

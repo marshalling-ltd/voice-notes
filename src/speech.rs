@@ -1,6 +1,7 @@
 //! Text-to-speech: a Kokoro server (OpenAI-compatible `/v1/audio/speech`), or the system voice
 //! (`say` on macOS, `espeak-ng` elsewhere) as a fallback.
 
+use crate::playback::Playback;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -168,6 +169,9 @@ pub struct SpeechConfig {
     pub kokoro: Option<KokoroConfig>,
     /// Voice for the system engine (`espeak-ng` voice such as `en`, or a macOS `say` voice).
     pub system_voice: String,
+    /// The speaker to play Kokoro audio on: an id or a name, or `None` for the system default.
+    /// (The system voice always uses the default output; its tools cannot be pointed elsewhere.)
+    pub output_device: Option<String>,
 }
 
 impl SpeechConfig {
@@ -177,6 +181,7 @@ impl SpeechConfig {
         Self {
             kokoro: None,
             system_voice: voice.into(),
+            output_device: None,
         }
     }
 }
@@ -314,6 +319,10 @@ pub struct Speaker {
     client: reqwest::Client,
     child: Option<Child>,
     playing: Option<PathBuf>,
+    /// Kokoro audio being played through the chosen output device.
+    playback: Option<Playback>,
+    /// The chosen speaker was already reported missing, so it is not reported for every sentence.
+    reported_output: bool,
     queue: VecDeque<Item>,
     counter: usize,
     /// Kokoro failed once, so everything now uses the system voice.
@@ -329,6 +338,8 @@ impl Speaker {
             client: reqwest::Client::new(),
             child: None,
             playing: None,
+            playback: None,
+            reported_output: false,
             queue: VecDeque::new(),
             counter: 0,
             fell_back: false,
@@ -477,6 +488,25 @@ impl Speaker {
     }
 
     fn start_player(&mut self, path: PathBuf) -> Result<()> {
+        // Play through the chosen output device. If that cannot be done, fall back to the
+        // platform's own player, so a reply is still heard, and say why.
+        let played = std::fs::read(&path)
+            .context("could not read the speech audio")
+            .and_then(|wav| Playback::start(self.config.output_device.as_deref(), &wav));
+        let reason = match played {
+            Ok(mut playback) => {
+                if let Some(notice) = playback.take_notice()
+                    && !self.reported_output
+                {
+                    self.reported_output = true;
+                    self.notice = Some(notice);
+                }
+                let _ = std::fs::remove_file(&path); // the sound is in memory now
+                self.playback = Some(playback);
+                return Ok(());
+            }
+            Err(e) => format!("{e:#}"),
+        };
         let spawned = player_command(&path).and_then(|mut command| {
             command
                 .stdin(Stdio::null())
@@ -487,6 +517,7 @@ impl Speaker {
         });
         match spawned {
             Ok(child) => {
+                self.notice = Some(format!("{reason}; using the system player"));
                 self.child = Some(child);
                 self.playing = Some(path);
                 Ok(())
@@ -494,13 +525,23 @@ impl Speaker {
             Err(e) => {
                 let _ = std::fs::remove_file(&path);
                 self.queue.clear();
-                Err(e)
+                Err(e.context(reason))
             }
         }
     }
 
     /// Whether speech is still playing.
     pub fn is_speaking(&mut self) -> bool {
+        if let Some(playback) = self.playback.as_mut() {
+            if !playback.is_finished() {
+                return true;
+            }
+            if let Some(error) = playback.take_error() {
+                self.queue.clear();
+                self.notice = Some(error);
+            }
+            self.playback = None;
+        }
         match self.child.as_mut().map(Child::try_wait) {
             Some(Ok(None)) => true,
             Some(_) => {
@@ -518,9 +559,18 @@ impl Speaker {
         }
     }
 
+    /// Play on another speaker from now on (an id or a name; `None` is the system default).
+    pub fn set_output_device(&mut self, device: Option<String>) {
+        self.config.output_device = device;
+        self.reported_output = false;
+    }
+
     /// Cut speech off and forget anything queued.
     pub fn stop(&mut self) {
         self.queue.clear();
+        if let Some(mut playback) = self.playback.take() {
+            playback.stop();
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -698,6 +748,7 @@ mod tests {
                 voice: "v".into(),
             }),
             system_voice: "en".into(),
+            output_device: None,
         };
         let mut s = Speaker::new(kokoro);
         assert!(matches!(s.prepare("hi".into()), Item::Text(_))); // no runtime here
@@ -745,6 +796,36 @@ mod tests {
 
         let url = serve_once("200 OK", b"").await;
         assert!(fetch_audio(&client, &cfg(url), "hi").await.is_err());
+    }
+
+    /// Audio that cannot be played through the chosen speaker (here: not a WAV file) is handed to
+    /// the platform's own player, and the reason is reported, or if there is no player either,
+    /// the error says why. It never plays nothing silently.
+    #[tokio::test]
+    async fn audio_the_speaker_cannot_play_falls_back_to_the_system_player_with_a_reason() {
+        let url = serve_once("200 OK", b"RIFFfakewav").await;
+        let mut speaker = Speaker::new(SpeechConfig {
+            kokoro: Some(cfg(url)),
+            system_voice: "en".into(),
+            output_device: None,
+        });
+        let mut reported = speaker
+            .enqueue("hello there")
+            .err()
+            .map(|e| format!("{e:#}"));
+        for _ in 0..100 {
+            if reported.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            reported = match speaker.pump() {
+                Err(e) => Some(format!("{e:#}")),
+                Ok(()) => speaker.take_notice(),
+            };
+        }
+        speaker.stop();
+        let reported = reported.expect("the failure must be reported, not swallowed");
+        assert!(reported.contains("not a readable WAV file"), "{reported}");
     }
 
     /// An unreachable server is reported as an error, never a hang.
