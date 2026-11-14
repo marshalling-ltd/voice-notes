@@ -217,6 +217,190 @@ pub fn pick_whisper(ids: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// Which setting a [`Choice`] fills in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    /// The chat model behind the `fast` and `dev` profiles.
+    Chat,
+    /// The reasoning model behind the `smart` and `think` profiles.
+    Smart,
+    /// The speech-to-text model.
+    SpeechToText,
+}
+
+impl Field {
+    /// Name shown next to the value.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat (fast, dev)",
+            Self::Smart => "Smart (smart, think)",
+            Self::SpeechToText => "Speech-to-text",
+        }
+    }
+}
+
+/// One model to pick for one job: the recommended one, or any of the models on offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub field: Field,
+    /// What setup would pick by itself; `None` means there is nothing suitable.
+    pub recommended: Option<String>,
+    /// Every model the server offers for this job.
+    pub options: Vec<String>,
+    /// The option picked instead of the recommendation, if any.
+    pub selected: Option<usize>,
+}
+
+impl Choice {
+    /// The model that will be used: the picked one, else the recommendation.
+    #[must_use]
+    pub fn value(&self) -> Option<String> {
+        match self.selected {
+            Some(i) => self.options.get(i).cloned(),
+            None => self.recommended.clone(),
+        }
+    }
+
+    /// The value as shown, marking the recommended one.
+    #[must_use]
+    pub fn display(&self) -> String {
+        match self.value() {
+            Some(v) if Some(&v) == self.recommended.as_ref() => format!("{v} (recommended)"),
+            Some(v) => v,
+            None => "(none)".to_string(),
+        }
+    }
+
+    /// Step to the next value: the recommendation, then each option in turn, then around again.
+    pub fn next(&mut self) {
+        self.selected = match self.selected {
+            None if self.options.is_empty() => None,
+            None => Some(0),
+            Some(i) if i + 1 < self.options.len() => Some(i + 1),
+            Some(_) => None,
+        };
+    }
+
+    /// Step to the previous value.
+    pub fn previous(&mut self) {
+        self.selected = match self.selected {
+            None if self.options.is_empty() => None,
+            None => Some(self.options.len() - 1),
+            Some(0) => None,
+            Some(i) => Some(i - 1),
+        };
+    }
+}
+
+/// The models a person can pick between, for each job that has any, given the model ids the
+/// server offers and what setup recommends. Embedding, vision and speech models are never
+/// offered as chat models.
+///
+/// # Examples
+///
+/// ```
+/// use voice_notes::config::Config;
+/// use voice_notes::setup::{choices, Field};
+///
+/// let ids = ["whisper", "qwen-reasoner", "qwen3-coder-30b"].map(String::from);
+/// let recommended = Config {
+///     chat_model: Some("qwen3-coder-30b".into()),
+///     smart_model: Some("qwen-reasoner".into()),
+///     ..Config::default()
+/// };
+/// let mut rows = choices(&ids, &recommended);
+/// let chat = rows.iter_mut().find(|c| c.field == Field::Chat).unwrap();
+/// assert_eq!(chat.value().as_deref(), Some("qwen3-coder-30b"));
+/// // Swap the coder model for the reasoning model:
+/// chat.next();
+/// assert_eq!(chat.value().as_deref(), Some("qwen-reasoner"));
+/// ```
+#[must_use]
+pub fn choices(models: &[String], recommended: &Config) -> Vec<Choice> {
+    let mut chat_models: Vec<String> = models
+        .iter()
+        .filter(|id| chat_score(id).is_some())
+        .cloned()
+        .collect();
+    chat_models.sort();
+    let mut whisper_models: Vec<String> = models
+        .iter()
+        .filter(|id| id.to_lowercase().contains("whisper"))
+        .cloned()
+        .collect();
+    whisper_models.sort();
+
+    let row = |field, recommended: Option<String>, options: Vec<String>| Choice {
+        field,
+        recommended,
+        options,
+        selected: None,
+    };
+    let mut rows = Vec::new();
+    if !chat_models.is_empty() {
+        rows.push(row(
+            Field::Chat,
+            recommended.chat_model.clone(),
+            chat_models.clone(),
+        ));
+        rows.push(row(
+            Field::Smart,
+            recommended.smart_model.clone(),
+            chat_models,
+        ));
+    }
+    if !whisper_models.is_empty() {
+        rows.push(row(
+            Field::SpeechToText,
+            recommended
+                .stt_model
+                .clone()
+                .or_else(|| pick_whisper(&whisper_models)),
+            whisper_models,
+        ));
+    }
+    rows
+}
+
+/// Make each row show what `config` already holds, so reopening the chooser after a change
+/// shows the change instead of the recommendation.
+pub fn preselect(choices: &mut [Choice], config: &Config) {
+    for choice in choices {
+        let current = match choice.field {
+            Field::Chat => config.chat_model.clone(),
+            Field::Smart => config.smart_model.clone(),
+            Field::SpeechToText => config
+                .stt_model
+                .clone()
+                .or_else(|| choice.recommended.clone()),
+        };
+        if current != choice.value()
+            && let Some(current) = current
+        {
+            choice.selected = choice.options.iter().position(|o| *o == current);
+        }
+    }
+}
+
+/// The config with the picked models filled in over `base`. The default speech-to-text name
+/// is left out, as it needs no saving.
+#[must_use]
+pub fn apply_choices(base: &Config, choices: &[Choice]) -> Config {
+    let mut config = base.clone();
+    for choice in choices {
+        let value = choice.value();
+        match choice.field {
+            Field::Chat => config.chat_model = value,
+            Field::Smart => config.smart_model = value,
+            Field::SpeechToText => {
+                config.stt_model = value.filter(|v| v != DEFAULT_STT_MODEL);
+            }
+        }
+    }
+    config
+}
+
 /// A job a model or service does for the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -1536,5 +1720,164 @@ mod tests {
         assert_eq!(merged.server.as_deref(), Some("http://gpu-box:8080"));
         assert_eq!(merged.stt_url.as_deref(), Some("http://stt/x"));
         assert_eq!(merged.stt_model.as_deref(), Some("whisper-large-v3"));
+    }
+
+    fn your_server() -> Vec<String> {
+        ids(&[
+            "nomic-embed",
+            "qwen-reasoner",
+            "qwen25-vl-7b",
+            "qwen3-coder-30b",
+            "whisper",
+        ])
+    }
+
+    fn recommended() -> Config {
+        plan(&Findings {
+            models: Some(your_server()),
+            ..everything()
+        })
+        .config
+    }
+
+    fn row(rows: &[Choice], field: Field) -> &Choice {
+        rows.iter().find(|c| c.field == field).unwrap()
+    }
+
+    /// Each job lists only models that can do it: no embeddings, vision or speech models as
+    /// chat, and only Whisper models for speech-to-text.
+    #[test]
+    fn choices_offer_suitable_models_only() {
+        let rows = choices(&your_server(), &recommended());
+        assert_eq!(
+            rows.iter().map(|c| c.field).collect::<Vec<_>>(),
+            [Field::Chat, Field::Smart, Field::SpeechToText]
+        );
+        assert_eq!(
+            row(&rows, Field::Chat).options,
+            ["qwen-reasoner", "qwen3-coder-30b"]
+        );
+        assert_eq!(
+            row(&rows, Field::Smart).options,
+            ["qwen-reasoner", "qwen3-coder-30b"]
+        );
+        assert_eq!(row(&rows, Field::SpeechToText).options, ["whisper"]);
+        assert_eq!(
+            row(&rows, Field::Chat).value().as_deref(),
+            Some("qwen3-coder-30b")
+        );
+        assert_eq!(
+            row(&rows, Field::Smart).value().as_deref(),
+            Some("qwen-reasoner")
+        );
+    }
+
+    /// Stepping goes recommended, then each option, then back to the recommendation, in both
+    /// directions.
+    #[test]
+    fn choice_cycles_both_ways() {
+        let rows = choices(&your_server(), &recommended());
+        let mut chat = row(&rows, Field::Chat).clone();
+        assert_eq!(chat.display(), "qwen3-coder-30b (recommended)");
+        chat.next();
+        assert_eq!(chat.display(), "qwen-reasoner");
+        chat.next();
+        assert_eq!(
+            chat.display(),
+            "qwen3-coder-30b (recommended)",
+            "an option equal to the recommendation is marked"
+        );
+        chat.next();
+        assert_eq!(chat.selected, None, "wraps around to the recommendation");
+        chat.previous();
+        assert_eq!(chat.selected, Some(1));
+        chat.previous();
+        chat.previous();
+        assert_eq!(chat.selected, None);
+    }
+
+    /// A job with nothing recommended shows "(none)", and a row with no options does not move.
+    #[test]
+    fn empty_choices_are_harmless() {
+        let none = Choice {
+            field: Field::Smart,
+            recommended: None,
+            options: vec![],
+            selected: None,
+        };
+        assert_eq!(none.display(), "(none)");
+        let mut still = none.clone();
+        still.next();
+        still.previous();
+        assert_eq!(still, none);
+        assert_eq!(choices(&[], &Config::default()), []);
+        assert_eq!(
+            choices(&ids(&["nomic-embed", "qwen25-vl-7b"]), &Config::default()),
+            []
+        );
+    }
+
+    /// Only the jobs that have models get a row.
+    #[test]
+    fn rows_exist_only_for_available_jobs() {
+        let only_whisper = choices(&ids(&["whisper"]), &Config::default());
+        assert_eq!(
+            only_whisper.iter().map(|c| c.field).collect::<Vec<_>>(),
+            [Field::SpeechToText]
+        );
+        let only_chat = choices(&ids(&["llama-3-8b"]), &Config::default());
+        assert_eq!(
+            only_chat.iter().map(|c| c.field).collect::<Vec<_>>(),
+            [Field::Chat, Field::Smart]
+        );
+    }
+
+    /// Your example: swap the coder model for the reasoning model as the chat model.
+    #[test]
+    fn swapping_the_coder_for_the_reasoner() {
+        let base = recommended();
+        let mut rows = choices(&your_server(), &base);
+        rows.iter_mut()
+            .find(|c| c.field == Field::Chat)
+            .unwrap()
+            .next();
+        let config = apply_choices(&base, &rows);
+        assert_eq!(config.chat_model.as_deref(), Some("qwen-reasoner"));
+        assert_eq!(
+            config.smart_model.as_deref(),
+            Some("qwen-reasoner"),
+            "untouched rows keep their recommendation"
+        );
+        assert_eq!(
+            config.stt_model, None,
+            "the default speech-to-text name needs no saving"
+        );
+        assert_eq!(config.backend, base.backend, "everything else is kept");
+        assert_eq!(config.tts, base.tts);
+    }
+
+    /// Picking nothing changes nothing, and a non-default speech-to-text name is saved.
+    #[test]
+    fn applying_without_changes_and_with_a_named_whisper() {
+        let base = recommended();
+        let rows = choices(&your_server(), &base);
+        assert_eq!(apply_choices(&base, &rows), base);
+
+        let models = ids(&["whisper-small", "whisper-large-v3", "qwen3-coder-30b"]);
+        let base = plan(&Findings {
+            models: Some(models.clone()),
+            ..everything()
+        })
+        .config;
+        let mut rows = choices(&models, &base);
+        let stt = rows
+            .iter_mut()
+            .find(|c| c.field == Field::SpeechToText)
+            .unwrap();
+        stt.next(); // the first option, alphabetically: whisper-large-v3
+        assert_eq!(
+            apply_choices(&base, &rows).stt_model.as_deref(),
+            Some("whisper-large-v3")
+        );
     }
 }

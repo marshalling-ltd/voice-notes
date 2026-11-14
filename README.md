@@ -122,6 +122,8 @@ It reports:
 
 Sizes that were measured from real files are exact; estimates are marked with `~`. If the installed chat model is slower than your machine warrants, the suggestion is the model that fits (or the next size down if you are already there). This is a preview: nothing is downloaded yet.
 
+**Choosing models.** On the setup screen press `c` to pick the model for each job: chat (the `fast` and `dev` profiles), smart (the `smart` and `think` profiles) and speech-to-text. Each row starts on the recommended model; `↑↓` moves between jobs, `←→` steps through the models your server offers (embedding, vision and speech models are never offered as chat models), Enter accepts and Esc cancels. For example, swap the coder model for the reasoning model as your chat model, then press Enter on the setup screen to save. A saved choice is used straight away, for all three jobs, without restarting the app. Your server loads a model the first time it is used, so the first reply after a change can be slow. The same screen is reachable later with `u`. Models that are not installed yet cannot be picked until the downloader exists.
+
 Saved settings live in `~/.config/voice-notes/config.toml` (Linux) or `~/Library/Application Support/voice-notes/config.toml` (macOS). Precedence is: command-line flag, then saved settings, then built-in defaults.
 
 ### Voice
