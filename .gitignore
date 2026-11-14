@@ -1,1 +1,3 @@
 /target
+/stack/.env
+__pycache__/

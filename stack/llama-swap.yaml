@@ -1,0 +1,37 @@
+# llama-swap configuration for the CI model set (see ci-models.toml).
+# llama-swap starts one of these servers when a request names its model, and stops it when idle.
+# File names must match the files that fetch_models.py puts into /models.
+
+healthCheckTimeout: 180
+
+models:
+  # Speech to text. The name is what the client sends as the model (its default is "whisper").
+  # --tmp-dir: --convert writes temporary files, and the working directory (/models) is read-only.
+  whisper:
+    ttl: 600
+    cmd: >
+      whisper-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /models/ggml-tiny.en-q5_1.bin
+      --inference-path /v1/audio/transcriptions
+      --convert --tmp-dir /tmp
+
+  # Chat. Use it with: voice-notes --chat-model qwen3-0.6b
+  qwen3-0.6b:
+    ttl: 600
+    cmd: >
+      llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /models/Qwen3-0.6B-Q4_K_M.gguf
+      --jinja -c 2048
+
+# By default llama-swap keeps ONE model loaded and swaps on every request, which would unload
+# Whisper to load the chat model and back again on every voice turn (about 1.4 s lost each time
+# with the CI models). These two are small, so keep both loaded.
+groups:
+  voice:
+    swap: false
+    exclusive: false
+    members:
+      - "whisper"
+      - "qwen3-0.6b"

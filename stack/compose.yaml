@@ -1,0 +1,67 @@
+# The voice-notes service stack: everything the client talks to, started with one command.
+#
+#   docker compose -f stack/compose.yaml up --wait
+#
+# Chat and speech-to-text are served by llama-swap on port 8080 (it starts llama.cpp and
+# whisper.cpp on demand), text-to-speech by Kokoro on port 8880. Those are the addresses the
+# client uses by default, so `voice-notes` works against this stack without any flags (apart from
+# naming the models, see README.md).
+#
+# Everything listens on 127.0.0.1 only. Set STACK_BIND to change that, and read the security
+# notes in README.md first.
+
+name: voice-notes
+
+services:
+  # One-shot job: downloads the models listed in ci-models.toml into the models volume, checking
+  # the size and sha256 of every file. It does nothing if they are already there and correct.
+  # It reuses the llama-swap image because that already contains python3.
+  models:
+    image: ${LLAMA_SWAP_IMAGE:-ghcr.io/mostlygeek/llama-swap:unified-vulkan}
+    # -u: show progress in `docker logs` as it happens instead of all at the end.
+    entrypoint: ["python3", "-u", "/stack/fetch_models.py"]
+    command: ["--models-file", "/stack/models.toml", "--dest", "/models"]
+    volumes:
+      - models:/models
+      - ./fetch_models.py:/stack/fetch_models.py:ro
+      - ${MODELS_FILE:-./ci-models.toml}:/stack/models.toml:ro
+    restart: "no"
+
+  # Chat (llama.cpp) and speech to text (whisper.cpp) behind one OpenAI-compatible address.
+  # Models are loaded when first used, so the first request after a start is slow.
+  llama-swap:
+    image: ${LLAMA_SWAP_IMAGE:-ghcr.io/mostlygeek/llama-swap:unified-vulkan}
+    depends_on:
+      models:
+        condition: service_completed_successfully
+    environment:
+      LLAMA_SWAP_CONFIG: /etc/llama-swap/config.yaml
+    volumes:
+      - models:/models:ro
+      - ./llama-swap.yaml:/etc/llama-swap/config.yaml:ro
+    ports:
+      - "${STACK_BIND:-127.0.0.1}:${LLAMA_SWAP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # Text to speech. The model weights are part of the image.
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:${KOKORO_VERSION:-v0.10.0}
+    ports:
+      - "${STACK_BIND:-127.0.0.1}:${KOKORO_PORT:-8880}:8880"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8880/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  # Downloaded models, kept between runs. `docker compose down -v` deletes it.
+  models:
