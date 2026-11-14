@@ -14,8 +14,9 @@ use tokio::sync::oneshot;
 /// Panics if no local port can be bound, which fails the test.
 pub async fn capture_once(
     content_type: &'static str,
-    body: &'static str,
+    body: impl Into<String>,
 ) -> (String, oneshot::Receiver<String>) {
+    let body: String = body.into();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (tx, rx) = oneshot::channel();

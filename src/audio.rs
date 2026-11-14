@@ -513,6 +513,109 @@ where
         .context("could not open the microphone stream")
 }
 
+/// Turn any WAV file (mono or stereo, any sample rate, integer or float samples) into what the
+/// microphone path produces: 16 kHz, mono, 16-bit. Lets a recording stand in for the microphone.
+///
+/// # Errors
+///
+/// Returns an error if `data` is not a readable WAV file, or contains no audio.
+///
+/// # Examples
+///
+/// ```
+/// use voice_notes::audio::normalize_wav;
+///
+/// assert!(normalize_wav(b"definitely not a wav file").is_err());
+/// ```
+pub fn normalize_wav(data: &[u8]) -> Result<Vec<u8>> {
+    // Files streamed from a speech service declare an unknown length; repair those.
+    let repaired: Vec<u8>;
+    let mut reader = match hound::WavReader::new(Cursor::new(data)) {
+        Ok(reader) => reader,
+        Err(first) => {
+            repaired = repair_wav(data)
+                .ok_or(first)
+                .context("not a readable WAV file")?;
+            hound::WavReader::new(Cursor::new(repaired.as_slice()))
+                .context("not a readable WAV file")?
+        }
+    };
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels).max(1);
+    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Float, _) => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()
+            .context("could not read the WAV samples")?,
+        (hound::SampleFormat::Int, bits) if (1..=32).contains(&bits) => {
+            let scale = 2f64.powi(i32::from(bits) - 1);
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| int_to_unit(v, scale)))
+                .collect::<Result<_, _>>()
+                .context("could not read the WAV samples")?
+        }
+        (_, bits) => bail!("unsupported WAV sample size: {bits} bits"),
+    };
+    let mono: Vec<f32> = samples
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / count(frame.len()))
+        .collect();
+    if mono.is_empty() {
+        bail!("the WAV file contains no audio");
+    }
+    encode_wav(&resample(&mono, spec.sample_rate, TARGET_RATE))
+}
+
+/// Rebuild a WAV file whose `data` chunk declares a length that does not match the file, as
+/// streamed files do (`0xFFFFFFFF` means "unknown, read to the end"). Everything after the header is
+/// taken as audio, cut to a whole number of samples; other chunks are dropped. `None` if the
+/// bytes are not a RIFF/WAVE file with a format chunk and a data chunk.
+fn repair_wav(data: &[u8]) -> Option<Vec<u8>> {
+    if data.get(..4)? != b"RIFF" || data.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12;
+    let mut format: Option<[u8; 16]> = None;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let size =
+            usize::try_from(u32::from_le_bytes(data[pos + 4..pos + 8].try_into().ok()?)).ok()?;
+        let body = pos + 8;
+        if id == b"fmt " {
+            format = Some(data.get(body..body + 16)?.try_into().ok()?);
+        } else if id == b"data" {
+            let format = format?;
+            let block = usize::from(u16::from_le_bytes([format[12], format[13]]));
+            if block == 0 {
+                return None;
+            }
+            let available = data.len() - body;
+            let length = size.min(available);
+            let length = length - length % block;
+            let length_field = u32::try_from(length).ok()?;
+            let mut fixed = Vec::with_capacity(44 + length);
+            fixed.extend_from_slice(b"RIFF");
+            fixed.extend_from_slice(&(36 + length_field).to_le_bytes());
+            fixed.extend_from_slice(b"WAVEfmt ");
+            fixed.extend_from_slice(&16u32.to_le_bytes());
+            fixed.extend_from_slice(&format);
+            fixed.extend_from_slice(b"data");
+            fixed.extend_from_slice(&length_field.to_le_bytes());
+            fixed.extend_from_slice(&data[body..body + length]);
+            return Some(fixed);
+        }
+        pos = body.checked_add(size)?.checked_add(size & 1)?;
+    }
+    None
+}
+
+/// An integer sample as a number between -1 and 1.
+#[allow(clippy::cast_possible_truncation)]
+fn int_to_unit(value: i32, scale: f64) -> f32 {
+    (f64::from(value) / scale) as f32
+}
+
 /// Linear-interpolation resampler; adequate for speech.
 ///
 /// Indices stay well inside f64's exact integer range and are never negative, so the
@@ -627,5 +730,179 @@ mod calibration_tests {
         let noisy: Vec<f32> = (0..16_000).map(|i| 0.1 * (i as f32 * 0.7).sin()).collect();
         let gate = noise_threshold(&noisy, 16_000, 0.01);
         assert!(gate > 0.1 && gate < 0.2, "gate was {gate}");
+    }
+}
+
+/// Tests for turning any WAV file into the microphone format.
+#[cfg(test)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+mod wav_tests {
+    use super::*;
+
+    /// Write a WAV file in memory: `seconds` of a 440 Hz tone at the given format.
+    fn tone_wav(channels: u16, rate: u32, bits: u16, float: bool, seconds: f32) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: rate,
+            bits_per_sample: bits,
+            sample_format: if float {
+                hound::SampleFormat::Float
+            } else {
+                hound::SampleFormat::Int
+            },
+        };
+        let mut bytes = Vec::new();
+        {
+            let mut writer = hound::WavWriter::new(Cursor::new(&mut bytes), spec).unwrap();
+            let frames = (rate as f32 * seconds) as u32;
+            for i in 0..frames {
+                let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                for _ in 0..channels {
+                    if float {
+                        writer.write_sample(v).unwrap();
+                    } else {
+                        let max = 2f32.powi(i32::from(bits) - 1) - 1.0;
+                        writer.write_sample((v * max) as i32).unwrap();
+                    }
+                }
+            }
+            writer.finalize().unwrap();
+        }
+        bytes
+    }
+
+    fn read_back(wav: &[u8]) -> (hound::WavSpec, Vec<i16>) {
+        let reader = hound::WavReader::new(Cursor::new(wav)).unwrap();
+        let spec = reader.spec();
+        (
+            spec,
+            reader.into_samples::<i16>().map(Result::unwrap).collect(),
+        )
+    }
+
+    /// Whatever the input format, the result is 16 kHz mono 16-bit of the same duration.
+    #[test]
+    fn normalizes_any_wav_to_16k_mono() {
+        for (channels, rate, bits, float) in [
+            (1, 16_000, 16, false), // already right
+            (2, 44_100, 16, false), // CD quality stereo
+            (1, 48_000, 24, false), // studio mono
+            (2, 8_000, 32, false),  // telephone-rate, wide samples
+            (1, 22_050, 32, true),  // floating point
+            (1, 16_000, 8, false),  // 8-bit
+        ] {
+            let out = normalize_wav(&tone_wav(channels, rate, bits, float, 1.0)).unwrap();
+            let (spec, samples) = read_back(&out);
+            assert_eq!(
+                (spec.channels, spec.sample_rate, spec.bits_per_sample),
+                (1, 16_000, 16),
+                "{channels}ch {rate}Hz {bits}bit"
+            );
+            assert!(
+                (samples.len() as i64 - 16_000).abs() <= 2,
+                "{channels}ch {rate}Hz {bits}bit gave {} samples",
+                samples.len()
+            );
+            assert!(
+                samples.iter().any(|s| s.abs() > 8_000),
+                "the tone survives ({channels}ch {rate}Hz {bits}bit)"
+            );
+        }
+    }
+
+    /// Stereo channels are averaged, so a tone in both channels keeps its level.
+    #[test]
+    fn stereo_is_downmixed_not_summed() {
+        let out = normalize_wav(&tone_wav(2, 16_000, 16, false, 0.5)).unwrap();
+        let (_, samples) = read_back(&out);
+        let peak = samples.iter().map(|s| s.abs()).max().unwrap();
+        assert!(
+            (15_000..=17_500).contains(&peak),
+            "a 0.5 amplitude tone peaks near 16384, got {peak}"
+        );
+    }
+
+    /// Make a WAV the way a streaming speech server does: an extra metadata chunk, a `data` chunk
+    /// of unknown length (`0xFFFFFFFF`) and an unknown overall length.
+    fn streamed(standard: &[u8]) -> Vec<u8> {
+        let mut out = standard[..36].to_vec(); // the header up to the `data` chunk
+        out[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(b"LIST");
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(b"INFO");
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(&standard[44..]);
+        out
+    }
+
+    /// Kokoro's real files look like this: a length of `0xFFFFFFFF` and an extra chunk. They
+    /// are read in full instead of being rejected.
+    #[test]
+    fn reads_streamed_wav_with_unknown_length() {
+        let standard = tone_wav(1, 24_000, 16, false, 1.0);
+        let file = streamed(&standard);
+        assert!(
+            hound::WavReader::new(Cursor::new(file.as_slice())).is_err(),
+            "the plain reader refuses it"
+        );
+        let out = normalize_wav(&file).unwrap();
+        let (spec, samples) = read_back(&out);
+        assert_eq!((spec.channels, spec.sample_rate), (1, 16_000));
+        assert!(
+            (samples.len() as i64 - 16_000).abs() <= 2,
+            "all of the audio is kept, got {}",
+            samples.len()
+        );
+        assert!(samples.iter().any(|s| s.abs() > 8_000));
+    }
+
+    /// A streamed file cut in the middle of a sample loses only that half sample.
+    #[test]
+    fn streamed_wav_cut_mid_sample() {
+        let mut file = streamed(&tone_wav(1, 16_000, 16, false, 0.5));
+        file.push(0x7f); // a stray odd byte at the end
+        let out = normalize_wav(&file).unwrap();
+        assert_eq!(read_back(&out).1.len(), 8_000);
+    }
+
+    /// Repair only applies to real WAV layouts: other bytes, and WAV files missing a part, are
+    /// still rejected.
+    #[test]
+    fn repair_does_not_accept_junk() {
+        assert!(repair_wav(b"").is_none());
+        assert!(repair_wav(b"RIFF....WAVE").is_none(), "no chunks");
+        let standard = tone_wav(1, 16_000, 16, false, 0.1);
+        assert!(repair_wav(&standard[..36]).is_none(), "no data chunk");
+        let mut no_fmt = b"RIFF\0\0\0\0WAVE".to_vec();
+        no_fmt.extend_from_slice(b"data");
+        no_fmt.extend_from_slice(&4u32.to_le_bytes());
+        no_fmt.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(repair_wav(&no_fmt).is_none(), "data before any format");
+        assert!(normalize_wav(b"RIFF....WAVEjunkjunkjunk").is_err());
+    }
+
+    /// Garbage, an empty file and a WAV with no audio are all rejected with a reason.
+    #[test]
+    fn rejects_bad_input() {
+        assert!(
+            normalize_wav(b"not a wav")
+                .unwrap_err()
+                .to_string()
+                .contains("WAV")
+        );
+        assert!(normalize_wav(b"").is_err());
+        let empty = tone_wav(1, 16_000, 16, false, 0.0);
+        assert!(
+            normalize_wav(&empty)
+                .unwrap_err()
+                .to_string()
+                .contains("no audio")
+        );
     }
 }

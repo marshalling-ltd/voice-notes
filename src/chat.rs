@@ -467,10 +467,10 @@ mod tests {
     fn claude_args_start_then_resume() {
         let first = claude_args("abc", false, SPOKEN_STYLE);
         assert!(first.windows(2).any(|w| w == ["--session-id", "abc"]));
-        assert!(!first.contains(&"--resume".to_string()));
+        assert!(!first.iter().any(|a| a == "--resume"));
         let later = claude_args("abc", true, DEV_STYLE);
         assert!(later.windows(2).any(|w| w == ["--resume", "abc"]));
-        assert!(later.contains(&"--allowedTools=Read,Grep,Glob".to_string()));
+        assert!(later.iter().any(|a| a == "--allowedTools=Read,Grep,Glob"));
         assert_eq!(later[0], "-p");
     }
 
