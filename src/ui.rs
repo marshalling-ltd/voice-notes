@@ -20,7 +20,7 @@ use crate::chat::{Conversation, ReplyDelta};
 use crate::config::Config;
 use crate::endpoints::Endpoints;
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
-use crate::setup::{self, Findings};
+use crate::setup::{self, Choice, Findings};
 use crate::speech::{SentenceSplitter, Speaker};
 use crate::transcribe::{TranscribeOptions, clean_transcript};
 use anyhow::Result;
@@ -149,10 +149,23 @@ pub type Resolver = Arc<dyn Fn(&Config, Option<&str>) -> Result<Settings> + Send
 pub enum SetupState {
     /// Still looking around.
     Probing,
-    /// Findings are in; `config` is what saving would write.
-    Ready { lines: Vec<String>, config: Config },
+    /// Findings are in; `config` is what saving would write, `recommended` is what setup chose
+    /// by itself, and `models` are the model ids the server offers.
+    Ready {
+        lines: Vec<String>,
+        config: Config,
+        recommended: Config,
+        models: Vec<String>,
+    },
     /// Saved; shows the confirmation.
     Done(String),
+}
+
+/// The model chooser: one row per job, with the focused row highlighted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chooser {
+    pub choices: Vec<Choice>,
+    pub focus: usize,
 }
 
 /// Everything the screen shows.
@@ -179,6 +192,8 @@ pub struct App {
     pub cloud: bool,
     /// The setup screen, when it is open.
     pub setup: Option<SetupState>,
+    /// The model chooser, opened from the setup screen.
+    pub chooser: Option<Chooser>,
     /// The profile in use, and every profile `p` can switch to.
     pub profile: String,
     pub profiles: Vec<String>,
@@ -206,6 +221,7 @@ impl App {
             turns: Vec::new(),
             backend_label: String::new(),
             setup: None,
+            chooser: None,
             profile: String::new(),
             profiles: Vec::new(),
             speak_enabled: true,
@@ -463,6 +479,10 @@ impl App {
             self.quit = true;
             return None;
         }
+        if self.chooser.is_some() {
+            self.on_chooser_key(key);
+            return None;
+        }
         match &self.setup {
             None => None,
             Some(SetupState::Probing) => match key.code {
@@ -482,10 +502,66 @@ impl App {
                     }
                     KeyCode::Enter | KeyCode::Char('y') => Some(Action::SaveSetup),
                     KeyCode::Char('s') | KeyCode::Esc => Some(Action::SkipSetup),
+                    KeyCode::Char('c') => {
+                        self.open_chooser();
+                        None
+                    }
                     _ => None,
                 }
             }
         }
+    }
+
+    /// Open the model chooser from the setup screen, showing what is currently picked. Does
+    /// nothing if the server offered no models to choose between.
+    fn open_chooser(&mut self) {
+        let Some(SetupState::Ready {
+            config,
+            recommended,
+            models,
+            ..
+        }) = &self.setup
+        else {
+            return;
+        };
+        let mut choices = setup::choices(models, recommended);
+        if choices.is_empty() {
+            return;
+        }
+        setup::preselect(&mut choices, config);
+        self.chooser = Some(Chooser { choices, focus: 0 });
+    }
+
+    /// Keys while the model chooser is open.
+    fn on_chooser_key(&mut self, key: KeyEvent) {
+        let Some(mut chooser) = self.chooser.take() else {
+            return;
+        };
+        let last = chooser.choices.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => chooser.focus = chooser.focus.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => chooser.focus = (chooser.focus + 1).min(last),
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('l' | ' ') => {
+                if let Some(choice) = chooser.choices.get_mut(chooser.focus) {
+                    choice.next();
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(choice) = chooser.choices.get_mut(chooser.focus) {
+                    choice.previous();
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(SetupState::Ready { lines, config, .. }) = &mut self.setup {
+                    *config = setup::apply_choices(config, &chooser.choices);
+                    refresh_save_block(lines, config);
+                }
+                return; // the chooser closes
+            }
+            KeyCode::Esc => return, // the chooser closes, nothing changes
+            _ => {}
+        }
+        self.chooser = Some(chooser);
     }
 
     /// Update what the header shows after the settings changed.
@@ -540,7 +616,7 @@ fn clock(d: Duration) -> String {
 /// Render the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(setup) = &app.setup {
-        draw_setup(frame, setup);
+        draw_setup(frame, setup, app.chooser.as_ref());
         return;
     }
     let [header, meter, body, footer] = Layout::vertical([
@@ -885,7 +961,11 @@ fn setup_line(text: &str) -> Line<'static> {
 }
 
 /// The first-run / `u` setup screen.
-fn draw_setup(frame: &mut Frame, setup: &SetupState) {
+fn draw_setup(frame: &mut Frame, setup: &SetupState, chooser: Option<&Chooser>) {
+    if let Some(chooser) = chooser {
+        draw_chooser(frame, chooser);
+        return;
+    }
     let [body, footer] =
         Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(frame.area());
     let block = panel("Voice Notes · Setup");
@@ -900,8 +980,13 @@ fn draw_setup(frame: &mut Frame, setup: &SetupState) {
             ))],
             vec![("s", " skip"), ("q", " quit")],
         ),
-        SetupState::Ready { lines, config } => {
-            let keys = if *config == Config::default() {
+        SetupState::Ready {
+            lines,
+            config,
+            models,
+            ..
+        } => {
+            let mut keys = if *config == Config::default() {
                 vec![
                     ("Enter", " close"),
                     ("s", " don't ask again"),
@@ -910,6 +995,9 @@ fn draw_setup(frame: &mut Frame, setup: &SetupState) {
             } else {
                 vec![("Enter", " save"), ("s", " skip"), ("q", " quit")]
             };
+            if !setup::choices(models, config).is_empty() {
+                keys.insert(1, ("c", " change models"));
+            }
             (lines.iter().map(|l| setup_line(l)).collect(), keys)
         }
         SetupState::Done(message) => (
@@ -936,23 +1024,100 @@ fn draw_setup(frame: &mut Frame, setup: &SetupState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), footer);
 }
 
+/// The "Will save" block that ends the setup report: the settings that saving would write.
+fn save_block(config: &Config) -> Vec<String> {
+    let Ok(toml) = config.render() else {
+        return Vec::new();
+    };
+    if *config == Config::default() {
+        return Vec::new();
+    }
+    let mut block = vec![String::new(), "Will save".to_string()];
+    block.extend(toml.lines().map(|l| format!("  {l}")));
+    block
+}
+
+/// Replace the "Will save" block in `lines` after the settings changed.
+fn refresh_save_block(lines: &mut Vec<String>, config: &Config) {
+    if let Some(at) = lines.iter().position(|l| l == "Will save") {
+        // Also drop the blank line that precedes the block.
+        lines.truncate(at.saturating_sub(1));
+    }
+    lines.extend(save_block(config));
+}
+
 /// Turn the findings into what the setup screen shows.
 fn setup_state(found: &Findings) -> SetupState {
     let plan = setup::plan(found);
     let text = setup::render(found, &plan);
     // Drop the report's own title and the blank line after it.
     let mut lines: Vec<String> = text.lines().skip(2).map(ToString::to_string).collect();
-    if plan.config != Config::default()
-        && let Ok(toml) = plan.config.render()
-    {
-        lines.push(String::new());
-        lines.push("Will save".to_string());
-        lines.extend(toml.lines().map(|l| format!("  {l}")));
-    }
+    lines.extend(save_block(&plan.config));
     SetupState::Ready {
         lines,
+        recommended: plan.config.clone(),
         config: plan.config,
+        models: found.models.clone().unwrap_or_default(),
     }
+}
+
+/// The model chooser screen.
+fn draw_chooser(frame: &mut Frame, chooser: &Chooser) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(frame.area());
+    let block = panel("Voice Notes · Choose models");
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Pick the model for each job. The recommended one is already selected.",
+            Style::new().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            "A saved choice is used straight away. Your server loads a model the first time it is used, so the first reply can be slow.",
+            Style::new().fg(DIM),
+        )),
+        Line::default(),
+    ];
+    for (i, choice) in chooser.choices.iter().enumerate() {
+        let focused = i == chooser.focus;
+        let marker = if focused { "▶ " } else { "  " };
+        let label = Style::new().fg(if focused { ACCENT } else { Color::White });
+        let value = if focused {
+            Style::new().fg(GOOD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::new().fg(ACCENT)),
+            Span::styled(format!("{:<22}", choice.field.label()), label),
+            Span::styled("‹ ", Style::new().fg(DIM)),
+            Span::styled(choice.display(), value),
+            Span::styled(" ›", Style::new().fg(DIM)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    let keys = [
+        ("↑↓", " row"),
+        ("←→", " change"),
+        ("Enter", " done"),
+        ("Esc", " cancel"),
+        ("q", " quit"),
+    ];
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, what)) in keys.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::new().fg(DIM)));
+        }
+        spans.push(Span::styled(
+            key,
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(what, Style::new().fg(DIM)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), footer);
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -1042,13 +1207,8 @@ struct Session {
 impl Session {
     fn new(settings: &Settings, resolve: Resolver, config: Config) -> Self {
         let client = reqwest::Client::new();
-        let opts = TranscribeOptions {
-            language: settings.language.clone(),
-            prompt: None,
-            url: settings.endpoints.stt.clone(),
-            model: settings.stt_model.clone(),
-        };
-        let (jobs, outcomes) = spawn_transcriber(client.clone(), opts);
+        let (jobs, outcomes) =
+            spawn_transcriber(client.clone(), Self::transcribe_options(settings));
         let (deltas_tx, deltas_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             recorder: AudioRecorder::new(settings.min_threshold, false),
@@ -1069,6 +1229,16 @@ impl Session {
             config,
             probe_task: None,
             resolve,
+        }
+    }
+
+    /// Where and how speech is transcribed under `settings`.
+    fn transcribe_options(settings: &Settings) -> TranscribeOptions {
+        TranscribeOptions {
+            language: settings.language.clone(),
+            prompt: None,
+            url: settings.endpoints.stt.clone(),
+            model: settings.stt_model.clone(),
         }
     }
 
@@ -1227,6 +1397,15 @@ impl Session {
         self.conversation = Arc::new(Mutex::new(Self::conversation(settings)));
         self.speaker.stop();
         self.speaker = Speaker::new(settings.speech.clone());
+        // A new speech-to-text model or address needs a new worker. The old one finishes what it
+        // is doing and stops when its sender is dropped; this runs only while nothing is being
+        // transcribed (setup and profile switching are available only when idle).
+        let (jobs, outcomes) =
+            spawn_transcriber(self.client.clone(), Self::transcribe_options(settings));
+        self.jobs = jobs;
+        self.outcomes = outcomes;
+        self.endpoints = settings.endpoints.clone();
+        self.clean_model.clone_from(&settings.clean_model);
         app.reconfigure(
             settings.backend.label(),
             settings.speak,
@@ -1940,7 +2119,7 @@ mod setup_tests {
     /// Findings become report lines plus the exact settings that would be saved.
     #[test]
     fn findings_become_a_report_and_a_config() {
-        let SetupState::Ready { lines, config } = setup_state(&found_everything()) else {
+        let SetupState::Ready { lines, config, .. } = setup_state(&found_everything()) else {
             panic!("expected a ready state");
         };
         let text = lines.join("\n");
@@ -1952,7 +2131,7 @@ mod setup_tests {
         );
         assert_eq!(config.chat_model.as_deref(), Some("qwen3-coder-30b"));
 
-        let SetupState::Ready { lines, config } = setup_state(&Findings::default()) else {
+        let SetupState::Ready { lines, config, .. } = setup_state(&Findings::default()) else {
             panic!("expected a ready state");
         };
         assert_eq!(config, Config::default());
@@ -2212,5 +2391,330 @@ mod privacy_tests {
         assert!(screen(&app).contains(NOTICE));
         app.reconfigure("qwen3-coder-30b".into(), true, false);
         assert!(!screen(&app).contains(NOTICE));
+    }
+}
+
+/// Tests for the model chooser opened from the setup screen.
+#[cfg(test)]
+mod chooser_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// Your server: a fast coder model, a reasoning model, Whisper, and models that are not chat.
+    fn your_server() -> Findings {
+        Findings {
+            models: Some(
+                [
+                    "nomic-embed",
+                    "qwen-reasoner",
+                    "qwen25-vl-7b",
+                    "qwen3-coder-30b",
+                    "whisper",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+            kokoro_url: Some("http://127.0.0.1:8880/v1/audio/speech".into()),
+            system_voice: Some("espeak-ng"),
+            player: Some("paplay"),
+            ..Findings::default()
+        }
+    }
+
+    fn app_with(found: &Findings) -> App {
+        let mut app = App::new(false);
+        app.setup = Some(setup_state(found));
+        app
+    }
+
+    fn config_of(app: &App) -> Config {
+        match &app.setup {
+            Some(SetupState::Ready { config, .. }) => config.clone(),
+            other => panic!("expected a ready setup screen, got {other:?}"),
+        }
+    }
+
+    fn report_of(app: &App) -> String {
+        match &app.setup {
+            Some(SetupState::Ready { lines, .. }) => lines.join("\n"),
+            other => panic!("expected a ready setup screen, got {other:?}"),
+        }
+    }
+
+    /// `c` opens the chooser, which shows the three jobs with their recommended models.
+    #[test]
+    fn c_opens_the_chooser() {
+        let mut app = app_with(&your_server());
+        assert!(
+            screen(&app).contains(" change models"),
+            "the setup screen offers it"
+        );
+        assert_eq!(app.on_key(press(KeyCode::Char('c'))), None);
+        assert!(app.chooser.is_some());
+        let text = screen(&app);
+        for expected in [
+            "Choose models",
+            "Chat (fast, dev)",
+            "qwen3-coder-30b (recommended)",
+            "Smart (smart, think)",
+            "qwen-reasoner (recommended)",
+            "Speech-to-text",
+            "whisper (recommended)",
+            "row",
+            "change",
+            "cancel",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert!(
+            !text.contains("nomic-embed") && !text.contains("qwen25-vl"),
+            "not chat models"
+        );
+    }
+
+    /// Your example: swap the coder model for the reasoning model, then save it.
+    #[test]
+    fn swapping_coder_for_reasoner_and_saving() {
+        let mut app = app_with(&your_server());
+        assert_eq!(
+            config_of(&app).chat_model.as_deref(),
+            Some("qwen3-coder-30b")
+        );
+        app.on_key(press(KeyCode::Char('c')));
+        app.on_key(press(KeyCode::Right)); // chat row: the next model
+        assert!(
+            screen(&app).contains("‹ qwen-reasoner ›"),
+            "{}",
+            screen(&app)
+        );
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.chooser.is_none(), "the chooser closes");
+
+        assert_eq!(config_of(&app).chat_model.as_deref(), Some("qwen-reasoner"));
+        let report = report_of(&app);
+        assert!(
+            report.contains("chat_model = \"qwen-reasoner\""),
+            "{report}"
+        );
+        assert!(
+            !report.contains("chat_model = \"qwen3-coder-30b\""),
+            "{report}"
+        );
+        assert_eq!(
+            report.matches("Will save").count(),
+            1,
+            "the block is replaced, not repeated"
+        );
+        // Saving is the usual Enter on the setup screen.
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Some(Action::SaveSetup));
+    }
+
+    /// Escape leaves everything as it was.
+    #[test]
+    fn escape_cancels() {
+        let mut app = app_with(&your_server());
+        let before = config_of(&app);
+        app.on_key(press(KeyCode::Char('c')));
+        app.on_key(press(KeyCode::Right));
+        app.on_key(press(KeyCode::Esc));
+        assert!(app.chooser.is_none() && app.setup.is_some());
+        assert_eq!(config_of(&app), before);
+    }
+
+    /// Up and down move between jobs without going past the ends, and left goes back.
+    #[test]
+    fn focus_and_direction_keys() {
+        let mut app = app_with(&your_server());
+        app.on_key(press(KeyCode::Char('c')));
+        let focus = |app: &App| app.chooser.as_ref().unwrap().focus;
+        assert_eq!(focus(&app), 0);
+        app.on_key(press(KeyCode::Up));
+        assert_eq!(focus(&app), 0, "no going above the first row");
+        for _ in 0..5 {
+            app.on_key(press(KeyCode::Down));
+        }
+        assert_eq!(focus(&app), 2, "no going below the last row");
+        app.on_key(press(KeyCode::Char('k')));
+        assert_eq!(focus(&app), 1);
+
+        // Left steps back to the recommendation after stepping forward.
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(app.chooser.as_ref().unwrap().choices[1].selected, Some(0));
+        app.on_key(press(KeyCode::Left));
+        assert_eq!(app.chooser.as_ref().unwrap().choices[1].selected, None);
+    }
+
+    /// Reopening the chooser shows the change that was made, not the original recommendation.
+    #[test]
+    fn reopening_shows_the_current_pick() {
+        let mut app = app_with(&your_server());
+        app.on_key(press(KeyCode::Char('c')));
+        app.on_key(press(KeyCode::Right));
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Char('c')));
+        let chat = &app.chooser.as_ref().unwrap().choices[0];
+        assert_eq!(chat.value().as_deref(), Some("qwen-reasoner"));
+        assert_eq!(
+            chat.display(),
+            "qwen-reasoner",
+            "not marked as the recommendation"
+        );
+    }
+
+    /// With no models to choose between (the server did not answer), `c` does nothing and the
+    /// setup screen does not offer it.
+    #[test]
+    fn nothing_to_choose_without_models() {
+        let mut app = app_with(&Findings::default());
+        assert!(!screen(&app).contains("change models"));
+        app.on_key(press(KeyCode::Char('c')));
+        assert!(app.chooser.is_none());
+        let mut probing = App::new(false);
+        probing.setup = Some(SetupState::Probing);
+        probing.on_key(press(KeyCode::Char('c')));
+        assert!(probing.chooser.is_none());
+    }
+
+    /// Quitting works from inside the chooser.
+    #[test]
+    fn quit_works_in_the_chooser() {
+        let mut app = app_with(&your_server());
+        app.on_key(press(KeyCode::Char('c')));
+        app.on_key(press(KeyCode::Char('q')));
+        assert!(app.quit);
+    }
+
+    /// A machine with a single chat model still gets rows, and picking a Whisper name by hand
+    /// is saved.
+    #[test]
+    fn single_model_and_named_whisper() {
+        let found = Findings {
+            models: Some(
+                ["whisper-small", "whisper-large-v3", "llama-3-8b"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            ..your_server()
+        };
+        let mut app = app_with(&found);
+        app.on_key(press(KeyCode::Char('c')));
+        for _ in 0..2 {
+            app.on_key(press(KeyCode::Down));
+        }
+        app.on_key(press(KeyCode::Right)); // speech-to-text: first option, whisper-large-v3
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            config_of(&app).stt_model.as_deref(),
+            Some("whisper-large-v3")
+        );
+        assert_eq!(config_of(&app).chat_model.as_deref(), Some("llama-3-8b"));
+    }
+}
+
+/// Tests for switching a running session to new settings.
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::chat::Backend;
+    use crate::speech::SpeechConfig;
+    use std::time::Duration;
+
+    fn settings(stt_url: &str, stt_model: &str, clean_model: &str) -> Settings {
+        Settings {
+            clean: false,
+            min_threshold: 0.01,
+            language: Some("en".into()),
+            verbose: false,
+            endpoints: Endpoints {
+                stt: stt_url.into(),
+                ..Endpoints::default()
+            },
+            stt_model: stt_model.into(),
+            clean_model: clean_model.into(),
+            backend: Backend::Local {
+                model: "m".into(),
+                think: false,
+            },
+            system_prompt: None,
+            profile: "fast".into(),
+            profiles: vec!["fast".into()],
+            speak: false,
+            speech: SpeechConfig::system("en"),
+            talk: false,
+        }
+    }
+
+    fn unused_resolver() -> Resolver {
+        Arc::new(|_, _| anyhow::bail!("not used in this test"))
+    }
+
+    /// After new settings are applied, speech is transcribed at the new address with the new
+    /// model name, even though the session started with an address that goes nowhere.
+    #[tokio::test]
+    async fn applying_settings_rebuilds_the_transcriber() {
+        let (base, request) =
+            crate::test_support::capture_once("application/json", r#"{"text":"hello there"}"#)
+                .await;
+        let old = settings("http://127.0.0.1:1/old-stt", "old-whisper", "old-clean");
+        let mut session = Session::new(&old, unused_resolver(), Config::default());
+        let mut app = App::new(false);
+
+        let new = settings(&format!("{base}/new-stt"), "new-whisper", "new-clean");
+        session.apply(&mut app, &new);
+
+        session
+            .jobs
+            .send(Job {
+                id: 0,
+                wav: b"RIFFfakewav".to_vec(),
+            })
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), session.outcomes.recv())
+            .await
+            .expect("the new transcriber should answer")
+            .expect("the outcome channel should stay open");
+        assert_eq!(
+            outcome,
+            Outcome::Text {
+                id: 0,
+                text: "hello there".into()
+            }
+        );
+        let sent = request.await.unwrap();
+        assert!(sent.starts_with("POST /new-stt "), "{sent}");
+        assert!(
+            sent.contains("new-whisper") && !sent.contains("old-whisper"),
+            "{sent}"
+        );
+    }
+
+    /// The other settings that the session keeps for later use are refreshed too.
+    #[tokio::test]
+    async fn applying_settings_refreshes_endpoints_and_clean_model() {
+        let old = settings("http://127.0.0.1:1/a", "w", "old-clean");
+        let mut session = Session::new(&old, unused_resolver(), Config::default());
+        let mut app = App::new(false);
+        let new = settings("http://127.0.0.1:1/b", "w", "new-clean");
+        session.apply(&mut app, &new);
+        assert_eq!(session.endpoints.stt, "http://127.0.0.1:1/b");
+        assert_eq!(session.clean_model, "new-clean");
+        assert_eq!(app.profile, "fast");
     }
 }
