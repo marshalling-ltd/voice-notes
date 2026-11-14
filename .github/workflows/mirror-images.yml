@@ -1,0 +1,55 @@
+name: Mirror images
+
+# Copies the container images pinned in stack/compose.yaml to our own ghcr.io namespace, keeping
+# each image's digest, so the stack still works if an upstream project deletes or rewrites its
+# images. The copy is registry to registry (`docker buildx imagetools create`), which keeps the
+# multi-architecture manifest and therefore the very same digest. The job fails if a copy has a
+# different digest.
+#
+# Run it by hand after the pins in compose.yaml change. To run the stack from the mirror, set
+# LLAMA_SWAP_IMAGE and KOKORO_IMAGE to `<prefix>/<name>@<same digest>` (see stack/README.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "Destination prefix (default: ghcr.io/<owner>/voice-notes-images)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check that every image is pinned
+        run: python3 stack/pin_images.py --check
+
+      - name: Work out the destination
+        id: dest
+        env:
+          INPUT_PREFIX: ${{ inputs.prefix }}
+        run: |
+          prefix="${INPUT_PREFIX:-ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/voice-notes-images}"
+          echo "prefix=${prefix}" >> "$GITHUB_OUTPUT"
+          echo "Mirroring to ${prefix}"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror the images
+        env:
+          PREFIX: ${{ steps.dest.outputs.prefix }}
+        run: python3 stack/pin_images.py --mirror "$PREFIX"
