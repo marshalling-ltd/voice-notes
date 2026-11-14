@@ -8,6 +8,7 @@ pub mod catalogue;
 pub mod chat;
 pub mod config;
 pub mod devices;
+pub mod download;
 pub mod endpoints;
 pub mod hardware;
 pub mod headless;

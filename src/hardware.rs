@@ -192,6 +192,13 @@ pub fn classify_amd(name: &str, vram: u64, gtt: u64, ram: Option<u64>) -> Gpu {
     }
 }
 
+/// Free bytes on the disk that holds `path` (a folder that exists), from `df`. `None` if it
+/// cannot be found out.
+#[must_use]
+pub fn free_space(path: &std::path::Path) -> Option<u64> {
+    run("df", &["-Pk", &path.to_string_lossy()]).and_then(|out| parse_df(&out))
+}
+
 fn run(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
     output
@@ -357,6 +364,18 @@ mod tests {
     }
 
     /// Free space comes from the "Available" column of `df -Pk`.
+    /// The free space of a folder that exists is found with the real `df` on this machine.
+    #[test]
+    #[cfg(unix)]
+    fn free_space_of_a_real_folder_is_known() {
+        let free = free_space(&std::env::temp_dir());
+        assert!(free.is_some_and(|bytes| bytes > 0), "{free:?}");
+        assert_eq!(
+            free_space(std::path::Path::new("/definitely/not/a/folder")),
+            None
+        );
+    }
+
     #[test]
     fn parses_df() {
         let out = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 3795284464 39487576 3562932224 2% /\n";

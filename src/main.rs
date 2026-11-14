@@ -9,6 +9,9 @@ mod catalogue;
 mod chat;
 mod config;
 mod devices;
+// Used by the models screen and first-run setup (VN-19 and VN-30); not by the program yet.
+#[allow(dead_code)]
+mod download;
 mod endpoints;
 mod hardware;
 mod headless;
