@@ -21,7 +21,7 @@ Ticket #29 (VN-23): where do the catalogue's download URLs point for the first w
 | `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` | `b17cb02dd882` |
 | `hexgrad/Kokoro-82M` | `f3ff3571791e` |
 
-To move to a newer version of a model, change the commit and the size and sha256 together in the catalogue (the sha256 is on the file's page on Hugging Face), and let the smoke test pass, like any other change.
+To move to a newer version of a model, change the commit and the size and sha256 together, in `models.toml` and in the `stack/` catalogue files that list the same file (a test fails if they disagree; the sha256 is on the file's page on Hugging Face), and let the smoke test pass, like any other change.
 
 ## What this does not protect against
 
