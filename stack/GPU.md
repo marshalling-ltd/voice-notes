@@ -5,10 +5,10 @@ Ticket #13: can llama.cpp and whisper.cpp use an AMD GPU through Vulkan inside t
 **Short answer: yes, it works, and it is worth it for bigger models and for speech to text.** It is opt-in, and the stack runs on the CPU by default.
 
 ```sh
-docker compose -f stack/compose.yaml -f stack/compose.gpu.yaml up --wait
+docker compose -f stack/compose.yaml -f stack/compose.gpu.yaml --profile power up --wait
 ```
 
-`compose.gpu.yaml` only passes `/dev/dri` into the `llama-swap` container. Nothing else changes, and Kokoro stays on the CPU because its image is a CPU build. The smoke test accepts `STACK_GPU=1` to run with it.
+`compose.gpu.yaml` only passes `/dev/dri` into the `llama-swap-<profile>` containers; use it with any profile. Nothing else changes, and Kokoro stays on the CPU because its image is a CPU build. The smoke test accepts `STACK_GPU=1` to run with it.
 
 ## What was tested
 
@@ -57,7 +57,7 @@ The `power` profile can use the GPU in containers, on machines with Vulkan and a
 - CI (GitHub runners have no GPU) and every other machine work unchanged;
 - a missing or wrong device never stops the stack from starting.
 
-Size-class profiles (#10) should pair `power` with `compose.gpu.yaml` and say plainly that it needs a GPU.
+The `power` profile is meant to be started with `compose.gpu.yaml`; the profile table in `README.md` says so.
 
 ## What it needs from the host
 

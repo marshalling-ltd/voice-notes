@@ -124,7 +124,7 @@ class FetchTests(unittest.TestCase):
     PAIRS = [
         ("ci-models.toml", "llama-swap.yaml"),
         ("nightly-models.toml", "llama-swap.nightly.yaml"),
-    ]
+    ] + [(f"profiles/{c}.toml", f"profiles/{c}.yaml") for c in ("minimal", "light", "standard", "power")]
 
     def test_real_catalogue_names_match_the_llama_swap_config(self):
         """The files llama-swap loads must be the ones the catalogue downloads."""
@@ -137,7 +137,9 @@ class FetchTests(unittest.TestCase):
             with open(os.path.join(here, swap_file)) as f:
                 swap = f.read()
             chosen = fetch_models.chosen_models(config, fetch_models.DEFAULT_ROLES)
-            self.assertEqual(len(chosen), 2, f"{models_file}: one speech-to-text and one chat model")
+            roles = sorted(m["role"] for m in chosen)
+            self.assertEqual(roles[0], "chat", models_file)
+            self.assertEqual(roles.count("speech-to-text"), 1, f"{models_file}: exactly one speech-to-text model")
             for model in chosen:
                 self.assertIn("/models/" + fetch_models.file_name(model["url"]), swap, f"{models_file}: {model['id']}")
 
@@ -185,6 +187,25 @@ class FetchTests(unittest.TestCase):
             members = set(re.findall(r'(?m)^      - "([^"]+)"', swap.split("\ngroups:", 1)[1]))
             self.assertEqual(defined, members, swap_file)
             self.assertIn("swap: false", swap, swap_file)
+            # Whisper is never unloaded by a chat model: its group does not swap.
+            groups = re.split(r"(?m)^  (?=\w+:\n)", swap.split("\ngroups:\n", 1)[1])
+            whisper_groups = [g for g in groups if '- "whisper"' in g]
+            self.assertEqual(len(whisper_groups), 1, swap_file)
+            self.assertIn("swap: false", whisper_groups[0], swap_file)
+
+    def test_every_profile_in_compose_points_at_files_that_exist(self):
+        import re
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "compose.yaml")) as f:
+            compose = f.read()
+        for name in ("minimal", "light", "standard", "power"):
+            self.assertIn(f'profiles: ["{name}"]', compose)
+            for ext in ("toml", "yaml"):
+                self.assertIn(f"./profiles/{name}.{ext}", compose)
+                self.assertTrue(os.path.isfile(os.path.join(here, "profiles", f"{name}.{ext}")))
+        self.assertEqual(len(re.findall(r"(?m)^  models-(\w+):", compose)), 5)
+        self.assertEqual(len(re.findall(r"(?m)^  llama-swap-(\w+):", compose)), 5)
 
     def test_gpu_override_only_passes_the_gpu_device_to_llama_swap(self):
         """The GPU file must stay an opt-in addition: no ports, images or models of its own."""
@@ -194,7 +215,8 @@ class FetchTests(unittest.TestCase):
         self.assertIn("/dev/dri:/dev/dri", text)
         for forbidden in ("ports:", "image:", "volumes:", "environment:", "command:"):
             self.assertNotIn(forbidden, text)
-        self.assertEqual(text.count("llama-swap:"), 1)
+        for name in ("ci", "minimal", "light", "standard", "power"):
+            self.assertIn(f"llama-swap-{name}:", text)
         self.assertNotIn("kokoro:", text, "Kokoro's image is a CPU build; it is left alone")
 
     def test_main_reports_missing_models(self):

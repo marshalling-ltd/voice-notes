@@ -1,0 +1,28 @@
+# Models of the `standard` size class: machines with 16 to 24 GB of memory for models.
+# Used by the `standard` compose profile together with standard.yaml (same folder).
+#
+# Sizes and sha256 values are those published by the model host (checked 2026-11-14). Licences are
+# as stated on each model card; they were not independently audited.
+
+[meta]
+checked = "2026-11-14"
+
+[[model]]
+id = "whisper-small"
+role = "speech-to-text"
+class = "standard"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+sha256 = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+size_bytes = 487601967
+licence = "MIT"
+chosen = true
+
+[[model]]
+id = "qwen3-14b-q4_k_m"
+role = "chat"
+class = "standard"
+url = "https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf"
+sha256 = "5eaa0870bd81ed3b58a630a271234cfa604e43ffb3a19cd68e54a80dd9d52a66"
+size_bytes = 9001753984
+licence = "Apache-2.0"
+chosen = true

@@ -1,55 +1,146 @@
 # The voice-notes service stack: everything the client talks to, started with one command.
 #
-#   docker compose -f stack/compose.yaml up --wait
+#   docker compose --profile light up --wait
 #
-# Chat and speech-to-text are served by llama-swap on port 8080 (it starts llama.cpp and
-# whisper.cpp on demand), text-to-speech by Kokoro on port 8880. Those are the addresses the
-# client uses by default, so `voice-notes` works against this stack without any flags (apart from
-# naming the models, see README.md).
+# Pick the profile that fits your machine: minimal, light, standard or power (the size classes,
+# see README.md for the models and memory of each). Chat and speech-to-text are served by
+# llama-swap on port 8080 (it starts llama.cpp and whisper.cpp on demand), text-to-speech by
+# Kokoro on port 8880. Those are the addresses the client uses by default, so `voice-notes` works
+# against this stack without any flags (apart from naming the models, see README.md).
+#
+# Run one profile at a time: they all use port 8080. Kokoro belongs to no profile, so it starts
+# with whichever one you choose. The `ci` profile is the tiny model set of the smoke test.
 #
 # Everything listens on 127.0.0.1 only. Set STACK_BIND to change that, and read the security
 # notes in README.md first.
 
 name: voice-notes
 
+# What every profile shares. Only the models file and the llama-swap config differ between them.
+x-models-job: &models-job
+  # One-shot job: downloads the models of the profile into the models volume, checking the size
+  # and sha256 of every file. It does nothing if they are already there and correct. It reuses
+  # the llama-swap image because that already contains python3.
+  image: ${LLAMA_SWAP_IMAGE:-ghcr.io/mostlygeek/llama-swap:unified-vulkan@sha256:80caa6f9d2ac19110504895b7061a00a54d6a38d12335c3a54906629135150f3}
+  # -u: show progress in `docker logs` as it happens instead of all at the end.
+  entrypoint: ["python3", "-u", "/stack/fetch_models.py"]
+  command: ["--models-file", "/stack/models.toml", "--dest", "/models"]
+  restart: "no"
+
+x-llama-swap: &llama-swap
+  # Chat (llama.cpp) and speech to text (whisper.cpp) behind one OpenAI-compatible address.
+  # Models are loaded when first used, so the first request after a start is slow.
+  image: ${LLAMA_SWAP_IMAGE:-ghcr.io/mostlygeek/llama-swap:unified-vulkan@sha256:80caa6f9d2ac19110504895b7061a00a54d6a38d12335c3a54906629135150f3}
+  environment:
+    LLAMA_SWAP_CONFIG: /etc/llama-swap/config.yaml
+  ports:
+    - "${STACK_BIND:-127.0.0.1}:${LLAMA_SWAP_PORT:-8080}:8080"
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+  restart: unless-stopped
+
 services:
-  # One-shot job: downloads the models listed in ci-models.toml into the models volume, checking
-  # the size and sha256 of every file. It does nothing if they are already there and correct.
-  # It reuses the llama-swap image because that already contains python3.
-  models:
-    image: ${LLAMA_SWAP_IMAGE:-ghcr.io/mostlygeek/llama-swap:unified-vulkan@sha256:80caa6f9d2ac19110504895b7061a00a54d6a38d12335c3a54906629135150f3}
-    # -u: show progress in `docker logs` as it happens instead of all at the end.
-    entrypoint: ["python3", "-u", "/stack/fetch_models.py"]
-    command: ["--models-file", "/stack/models.toml", "--dest", "/models"]
+  # ---- profile `ci`: The tiny models of the smoke test (ci-models.toml). MODELS_FILE and
+  # LLAMA_SWAP_CONFIG_FILE swap in another set, as the nightly run does.
+  models-ci:
+    <<: *models-job
+    profiles: ["ci"]
     volumes:
       - models:/models
       - ./fetch_models.py:/stack/fetch_models.py:ro
       - ${MODELS_FILE:-./ci-models.toml}:/stack/models.toml:ro
-    restart: "no"
 
-  # Chat (llama.cpp) and speech to text (whisper.cpp) behind one OpenAI-compatible address.
-  # Models are loaded when first used, so the first request after a start is slow.
-  llama-swap:
-    image: ${LLAMA_SWAP_IMAGE:-ghcr.io/mostlygeek/llama-swap:unified-vulkan@sha256:80caa6f9d2ac19110504895b7061a00a54d6a38d12335c3a54906629135150f3}
+  llama-swap-ci:
+    <<: *llama-swap
+    profiles: ["ci"]
     depends_on:
-      models:
+      models-ci:
         condition: service_completed_successfully
-    environment:
-      LLAMA_SWAP_CONFIG: /etc/llama-swap/config.yaml
     volumes:
       - models:/models:ro
       - ${LLAMA_SWAP_CONFIG_FILE:-./llama-swap.yaml}:/etc/llama-swap/config.yaml:ro
-    ports:
-      - "${STACK_BIND:-127.0.0.1}:${LLAMA_SWAP_PORT:-8080}:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 5s
-    restart: unless-stopped
 
-  # Text to speech. The model weights are part of the image.
+  # ---- profile `minimal`: under 8 GB for models
+  models-minimal:
+    <<: *models-job
+    profiles: ["minimal"]
+    volumes:
+      - models:/models
+      - ./fetch_models.py:/stack/fetch_models.py:ro
+      - ./profiles/minimal.toml:/stack/models.toml:ro
+
+  llama-swap-minimal:
+    <<: *llama-swap
+    profiles: ["minimal"]
+    depends_on:
+      models-minimal:
+        condition: service_completed_successfully
+    volumes:
+      - models:/models:ro
+      - ./profiles/minimal.yaml:/etc/llama-swap/config.yaml:ro
+
+  # ---- profile `light`: 8 to 16 GB
+  models-light:
+    <<: *models-job
+    profiles: ["light"]
+    volumes:
+      - models:/models
+      - ./fetch_models.py:/stack/fetch_models.py:ro
+      - ./profiles/light.toml:/stack/models.toml:ro
+
+  llama-swap-light:
+    <<: *llama-swap
+    profiles: ["light"]
+    depends_on:
+      models-light:
+        condition: service_completed_successfully
+    volumes:
+      - models:/models:ro
+      - ./profiles/light.yaml:/etc/llama-swap/config.yaml:ro
+
+  # ---- profile `standard`: 16 to 24 GB
+  models-standard:
+    <<: *models-job
+    profiles: ["standard"]
+    volumes:
+      - models:/models
+      - ./fetch_models.py:/stack/fetch_models.py:ro
+      - ./profiles/standard.toml:/stack/models.toml:ro
+
+  llama-swap-standard:
+    <<: *llama-swap
+    profiles: ["standard"]
+    depends_on:
+      models-standard:
+        condition: service_completed_successfully
+    volumes:
+      - models:/models:ro
+      - ./profiles/standard.yaml:/etc/llama-swap/config.yaml:ro
+
+  # ---- profile `power`: 24 GB or more; the one that benefits from the GPU, see GPU.md
+  models-power:
+    <<: *models-job
+    profiles: ["power"]
+    volumes:
+      - models:/models
+      - ./fetch_models.py:/stack/fetch_models.py:ro
+      - ./profiles/power.toml:/stack/models.toml:ro
+
+  llama-swap-power:
+    <<: *llama-swap
+    profiles: ["power"]
+    depends_on:
+      models-power:
+        condition: service_completed_successfully
+    volumes:
+      - models:/models:ro
+      - ./profiles/power.yaml:/etc/llama-swap/config.yaml:ro
+
+  # Text to speech. The model weights are part of the image. No profile: it always starts.
   kokoro:
     image: ${KOKORO_IMAGE:-ghcr.io/remsky/kokoro-fastapi-cpu:v0.10.0@sha256:f54c5960c2b9387f6349080a9944f8bc7e8cdb98a4ef9238cb0b0f9ff9795f44}
     ports:
@@ -63,5 +154,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  # Downloaded models, kept between runs. `docker compose down -v` deletes it.
+  # Downloaded models, kept between runs. `docker compose down -v` deletes it. Switching profile
+  # keeps the files of the other profiles, so the volume can grow; `down -v` frees it.
   models:

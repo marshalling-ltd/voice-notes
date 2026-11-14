@@ -1,0 +1,28 @@
+# Models of the `light` size class: machines with 8 to 16 GB of memory for models.
+# Used by the `light` compose profile together with light.yaml (same folder).
+#
+# Sizes and sha256 values are those published by the model host (checked 2026-11-14). Licences are
+# as stated on each model card; they were not independently audited.
+
+[meta]
+checked = "2026-11-14"
+
+[[model]]
+id = "whisper-small"
+role = "speech-to-text"
+class = "light"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+sha256 = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+size_bytes = 487601967
+licence = "MIT"
+chosen = true
+
+[[model]]
+id = "qwen3-8b-q4_k_m"
+role = "chat"
+class = "light"
+url = "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
+sha256 = "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4"
+size_bytes = 5027784512
+licence = "Apache-2.0"
+chosen = true
