@@ -1,5 +1,6 @@
+use crate::devices::{self, Direction};
 use anyhow::{Context, Result, anyhow, bail};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,6 +177,12 @@ pub struct AudioRecorder {
     skip_remaining: usize,
     stop_flag: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<f32>>>,
+    /// The first error the microphone stream reported while recording, until it is polled.
+    stream_error: Arc<Mutex<Option<MicError>>>,
+    /// The microphone to use: an id or a name, or `None` for the system default.
+    device: Option<String>,
+    /// A message from the last start, e.g. that the chosen microphone was not found.
+    notice: Option<String>,
     worker: Option<JoinHandle<()>>,
     segmenter: Option<Segmenter>,
     sample_rate: u32,
@@ -207,13 +214,36 @@ impl AudioRecorder {
             skip_remaining: 0,
             stop_flag: Arc::new(AtomicBool::new(false)),
             samples: Arc::new(Mutex::new(Vec::new())),
+            stream_error: Arc::new(Mutex::new(None)),
+            device: None,
+            notice: None,
             worker: None,
             segmenter: None,
             sample_rate: TARGET_RATE,
         }
     }
 
-    /// Open the default input device and start capturing in a background thread.
+    /// Record from this microphone (an id from [`crate::devices::list`], or a name) instead of
+    /// the system default. `None` is the default. If the chosen microphone is not there when
+    /// recording starts, the default is used and [`take_notice`](Self::take_notice) says so.
+    #[must_use]
+    pub fn with_device(mut self, device: Option<String>) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Change the microphone for the next recording (see [`with_device`](Self::with_device)).
+    pub fn set_device(&mut self, device: Option<String>) {
+        self.device = device;
+    }
+
+    /// A message from the last [`start_recording`](Self::start_recording), once: that the chosen
+    /// microphone was not found and the default is used instead.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
+    }
+
+    /// Open the chosen (or default) input device and start capturing in a background thread.
     ///
     /// # Errors
     ///
@@ -242,17 +272,23 @@ impl AudioRecorder {
             .lock()
             .map_err(|_| anyhow!("poisoned lock"))?
             .clear();
+        take_stream_error(&self.stream_error);
 
         let stop = Arc::clone(&self.stop_flag);
         let samples = Arc::clone(&self.samples);
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32>>();
+        let errors = Arc::clone(&self.stream_error);
+        let device = self.device.clone();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, Option<String>)>>();
 
         // cpal streams are not `Send`, so the stream lives entirely on this thread.
-        let handle = std::thread::spawn(move || capture(&stop, &ready_tx, &samples));
+        let handle = std::thread::spawn(move || {
+            capture(device.as_deref(), &stop, &ready_tx, &samples, &errors);
+        });
 
         match ready_rx.recv() {
-            Ok(Ok(rate)) => {
+            Ok(Ok((rate, notice))) => {
                 self.sample_rate = rate;
+                self.notice = notice;
                 // The device emits a loud start-up burst; ignore it.
                 self.skip_remaining = rate as usize * STARTUP_SKIP_MS / 1000;
                 self.segmenter = None;
@@ -355,7 +391,9 @@ impl AudioRecorder {
     ///
     /// # Errors
     ///
-    /// Returns an error if not recording, or if the capture buffer or WAV encoding fails.
+    /// Returns an error if not recording, if the microphone stream reported an error (for
+    /// example the device was unplugged; the error is then a [`MicError`]), or if the capture
+    /// buffer or WAV encoding fails.
     ///
     /// # Examples
     ///
@@ -370,6 +408,9 @@ impl AudioRecorder {
     pub fn poll_segments(&mut self) -> Result<Vec<Vec<u8>>> {
         if self.worker.is_none() {
             bail!("not recording");
+        }
+        if let Some(error) = take_stream_error(&self.stream_error) {
+            return Err(error.into());
         }
         let new = self.drain()?;
         if !new.is_empty() {
@@ -429,15 +470,146 @@ impl AudioRecorder {
     }
 }
 
-fn capture(stop: &AtomicBool, ready: &mpsc::Sender<Result<u32>>, samples: &Arc<Mutex<Vec<f32>>>) {
-    let (stream, sample_rate) = match open_stream(samples) {
+/// What is wrong with the microphone, as far as the person using the app can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicProblem {
+    /// There is no input device at all.
+    NoDevice,
+    /// The operating system refuses this program access to the microphone.
+    PermissionDenied,
+    /// The device was there but is gone: unplugged, or switched off.
+    Disconnected,
+    /// Another program is using the device.
+    Busy,
+    /// The sound server (or the audio subsystem) is not running.
+    NoSoundServer,
+    /// Anything else; the message carries the system's own words.
+    Other,
+}
+
+impl MicProblem {
+    fn from_kind(kind: cpal::ErrorKind) -> Self {
+        use cpal::ErrorKind;
+        match kind {
+            ErrorKind::PermissionDenied => Self::PermissionDenied,
+            ErrorKind::DeviceNotAvailable => Self::Disconnected,
+            ErrorKind::DeviceBusy => Self::Busy,
+            ErrorKind::HostUnavailable => Self::NoSoundServer,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A microphone problem, with a message that says what to do about it. The message fits on the
+/// interface's one-line warnings area (about 78 columns) and names the place to fix it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicError {
+    problem: MicProblem,
+    detail: String,
+}
+
+impl MicError {
+    /// A problem with the system's own description of it, used only for [`MicProblem::Other`].
+    #[must_use]
+    pub fn new(problem: MicProblem, detail: impl Into<String>) -> Self {
+        Self {
+            problem,
+            detail: detail.into(),
+        }
+    }
+
+    fn from_cpal(error: &cpal::Error) -> Self {
+        Self::new(MicProblem::from_kind(error.kind()), error.to_string())
+    }
+
+    /// What kind of problem it is.
+    // Part of the library's API; the binary compiles this module separately and does not call it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn problem(&self) -> MicProblem {
+        self.problem
+    }
+
+    /// The message for `problem`, for macOS if `macos` is set (it names the Settings page where
+    /// microphone access is granted) and for Linux otherwise.
+    #[must_use]
+    pub fn message(&self, macos: bool) -> String {
+        match (self.problem, macos) {
+            (MicProblem::NoDevice, _) => {
+                "No microphone found. Connect one and check that it is not disabled.".to_string()
+            }
+            (MicProblem::PermissionDenied, true) => {
+                "Mic access denied: System Settings > Privacy & Security > Microphone".to_string()
+            }
+            (MicProblem::PermissionDenied, false) => {
+                "Mic access denied. Check sound server (PipeWire/PulseAudio) permissions."
+                    .to_string()
+            }
+            (MicProblem::Disconnected, _) => {
+                "Microphone disconnected or unavailable. Reconnect it and press Enter.".to_string()
+            }
+            (MicProblem::Busy, _) => "Microphone is busy: another program is using it.".to_string(),
+            (MicProblem::NoSoundServer, true) => {
+                "Audio system unavailable. Check System Settings > Sound.".to_string()
+            }
+            (MicProblem::NoSoundServer, false) => {
+                "No sound server found. Start PipeWire or PulseAudio.".to_string()
+            }
+            (MicProblem::Other, _) => format!("Microphone error: {}", self.detail),
+        }
+    }
+}
+
+impl std::fmt::Display for MicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message(cfg!(target_os = "macos")))
+    }
+}
+
+impl std::error::Error for MicError {}
+
+/// Whether a stream error ends the recording. Glitches (`Xrun`), a route change that the stream
+/// follows by itself, and a refused real-time priority all leave the stream working.
+fn ends_recording(kind: cpal::ErrorKind) -> bool {
+    use cpal::ErrorKind;
+    !matches!(
+        kind,
+        ErrorKind::Xrun | ErrorKind::DeviceChanged | ErrorKind::RealtimeDenied
+    )
+}
+
+/// Remember an error reported by the microphone stream. Only the first is kept, since later ones
+/// are usually consequences of it. This runs on the audio thread, so it never blocks or prints:
+/// printing would scribble over the screen while the interface is open.
+fn record_stream_error(slot: &Mutex<Option<MicError>>, error: &cpal::Error) {
+    if !ends_recording(error.kind()) {
+        return;
+    }
+    if let Ok(mut slot) = slot.lock() {
+        slot.get_or_insert_with(|| MicError::from_cpal(error));
+    }
+}
+
+/// The recorded stream error, if any, clearing it.
+fn take_stream_error(slot: &Mutex<Option<MicError>>) -> Option<MicError> {
+    slot.lock().ok().and_then(|mut slot| slot.take())
+}
+
+fn capture(
+    device: Option<&str>,
+    stop: &AtomicBool,
+    ready: &mpsc::Sender<Result<(u32, Option<String>)>>,
+    samples: &Arc<Mutex<Vec<f32>>>,
+    errors: &Arc<Mutex<Option<MicError>>>,
+) {
+    let (stream, sample_rate, notice) = match open_stream(device, samples, errors) {
         Ok(v) => v,
         Err(e) => {
             let _ = ready.send(Err(e));
             return;
         }
     };
-    let _ = ready.send(Ok(sample_rate));
+    let _ = ready.send(Ok((sample_rate, notice)));
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(20));
@@ -445,27 +617,18 @@ fn capture(stop: &AtomicBool, ready: &mpsc::Sender<Result<u32>>, samples: &Arc<M
     drop(stream);
 }
 
-/// On Linux prefer the `PulseAudio` protocol (served by `PipeWire` and `PulseAudio`); the raw ALSA
-/// default often can't be opened when a sound server owns the hardware.
-#[cfg(target_os = "linux")]
-fn input_host() -> cpal::Host {
-    cpal::host_from_id(cpal::HostId::PulseAudio).unwrap_or_else(|_| cpal::default_host())
-}
-
-/// Elsewhere (macOS) the default host (`CoreAudio`) is the right one.
-#[cfg(not(target_os = "linux"))]
-fn input_host() -> cpal::Host {
-    cpal::default_host()
-}
-
-fn open_stream(samples: &Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32)> {
-    let host = input_host();
-    let device = host
-        .default_input_device()
-        .context("no default input device found (is a microphone available?)")?;
+fn open_stream(
+    wanted: Option<&str>,
+    samples: &Arc<Mutex<Vec<f32>>>,
+    errors: &Arc<Mutex<Option<MicError>>>,
+) -> Result<(cpal::Stream, u32, Option<String>)> {
+    let resolved = devices::resolve(Direction::Input, wanted)
+        .map_err(|e| MicError::new(MicProblem::Other, format!("{e:#}")))?
+        .ok_or_else(|| MicError::new(MicProblem::NoDevice, ""))?;
+    let (device, notice) = (resolved.device, resolved.notice);
     let config = device
         .default_input_config()
-        .context("could not get the microphone's input configuration")?;
+        .map_err(|e| MicError::from_cpal(&e))?;
 
     let sample_rate = config.sample_rate();
     let channels = config.channels() as usize;
@@ -473,15 +636,13 @@ fn open_stream(samples: &Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32)> {
     let config: cpal::StreamConfig = config.into();
 
     let stream = match format {
-        SampleFormat::I16 => build::<i16>(&device, config, channels, samples)?,
-        SampleFormat::I32 => build::<i32>(&device, config, channels, samples)?,
-        SampleFormat::F32 => build::<f32>(&device, config, channels, samples)?,
+        SampleFormat::I16 => build::<i16>(&device, config, channels, samples, errors)?,
+        SampleFormat::I32 => build::<i32>(&device, config, channels, samples, errors)?,
+        SampleFormat::F32 => build::<f32>(&device, config, channels, samples, errors)?,
         other => bail!("unsupported microphone sample format: {other}"),
     };
-    stream
-        .play()
-        .context("could not start the microphone stream")?;
-    Ok((stream, sample_rate))
+    stream.play().map_err(|e| MicError::from_cpal(&e))?;
+    Ok((stream, sample_rate, notice))
 }
 
 fn build<T>(
@@ -489,12 +650,14 @@ fn build<T>(
     config: cpal::StreamConfig,
     channels: usize,
     samples: &Arc<Mutex<Vec<f32>>>,
+    errors: &Arc<Mutex<Option<MicError>>>,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     let samples = Arc::clone(samples);
+    let errors = Arc::clone(errors);
     device
         .build_input_stream(
             config,
@@ -507,10 +670,10 @@ where
                     }
                 }
             },
-            |err| eprintln!("Microphone stream error: {err}"),
+            move |err| record_stream_error(&errors, &err),
             None,
         )
-        .context("could not open the microphone stream")
+        .map_err(|e| MicError::from_cpal(&e).into())
 }
 
 /// Turn any WAV file (mono or stereo, any sample rate, integer or float samples) into what the
@@ -625,7 +788,7 @@ fn int_to_unit(value: i32, scale: f64) -> f32 {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+pub(crate) fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || input.is_empty() {
         return input.to_vec();
     }
@@ -673,6 +836,161 @@ mod tests {
         (0..rate as usize * ms / 1000)
             .map(|i| amp * (i as f32 * 0.3).sin())
             .collect()
+    }
+
+    /// A recorder that looks as if it were recording, without opening a microphone.
+    fn pretend_recording() -> AudioRecorder {
+        let mut recorder = AudioRecorder::new(0.01, false);
+        recorder.worker = Some(std::thread::spawn(|| {}));
+        recorder
+    }
+
+    /// An error from the microphone stream (a device unplugged mid-recording) must reach the
+    /// caller through `poll_segments`, where the interface shows it; it must not be printed.
+    #[test]
+    fn a_stream_error_is_reported_by_the_next_poll() {
+        let mut recorder = pretend_recording();
+        assert!(recorder.poll_segments().is_ok(), "no error yet");
+        record_stream_error(
+            &recorder.stream_error,
+            &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+        );
+        let error = recorder.poll_segments().unwrap_err();
+        let mic = error
+            .downcast_ref::<MicError>()
+            .expect("a typed microphone error");
+        assert_eq!(mic.problem(), MicProblem::Disconnected);
+    }
+
+    /// The error is delivered once: after it was reported polling works as before.
+    #[test]
+    fn a_stream_error_is_reported_once() {
+        let mut recorder = pretend_recording();
+        record_stream_error(
+            &recorder.stream_error,
+            &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+        );
+        assert!(recorder.poll_segments().is_err());
+        assert!(recorder.poll_segments().is_ok());
+    }
+
+    /// Only the first error is kept: later ones are usually consequences of it.
+    #[test]
+    fn the_first_stream_error_wins() {
+        let slot = Mutex::new(None);
+        record_stream_error(
+            &slot,
+            &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+        );
+        record_stream_error(&slot, &cpal::Error::new(cpal::ErrorKind::PermissionDenied));
+        assert_eq!(
+            take_stream_error(&slot).map(|e| e.problem()),
+            Some(MicProblem::Disconnected)
+        );
+        assert_eq!(take_stream_error(&slot), None);
+    }
+
+    /// The operating system's reasons map to what a person can act on.
+    #[test]
+    fn cpal_error_kinds_become_microphone_problems() {
+        use cpal::ErrorKind as K;
+        let problem = |kind| MicError::from_cpal(&cpal::Error::new(kind)).problem();
+        assert_eq!(problem(K::PermissionDenied), MicProblem::PermissionDenied);
+        assert_eq!(problem(K::DeviceNotAvailable), MicProblem::Disconnected);
+        assert_eq!(problem(K::DeviceBusy), MicProblem::Busy);
+        assert_eq!(problem(K::HostUnavailable), MicProblem::NoSoundServer);
+        assert_eq!(problem(K::BackendError), MicProblem::Other);
+    }
+
+    /// On macOS the message says where microphone access is switched on.
+    #[test]
+    fn the_macos_permission_message_names_the_settings_page() {
+        let message = MicError::new(MicProblem::PermissionDenied, "").message(true);
+        for part in ["System Settings", "Privacy & Security", "Microphone"] {
+            assert!(message.contains(part), "{part} missing in {message:?}");
+        }
+        let linux = MicError::new(MicProblem::PermissionDenied, "").message(false);
+        assert!(!linux.contains("System Settings"), "{linux:?}");
+    }
+
+    /// Every message has to fit the interface's one-line warnings area (80 columns, minus the
+    /// margin and the warning sign), or the end of it, where the advice is, would be cut off.
+    #[test]
+    fn every_message_fits_on_the_warnings_line() {
+        use MicProblem::{Busy, Disconnected, NoDevice, NoSoundServer, Other, PermissionDenied};
+        for problem in [
+            NoDevice,
+            PermissionDenied,
+            Disconnected,
+            Busy,
+            NoSoundServer,
+            Other,
+        ] {
+            for macos in [true, false] {
+                let message = MicError::new(problem, "stream failed").message(macos);
+                assert!(
+                    message.chars().count() <= 75,
+                    "{problem:?} (macos: {macos}) is {} characters: {message}",
+                    message.chars().count()
+                );
+            }
+        }
+    }
+
+    /// Each kind of problem tells the person something different to do.
+    #[test]
+    fn each_problem_has_its_own_message() {
+        use MicProblem::{Busy, Disconnected, NoDevice, NoSoundServer, Other, PermissionDenied};
+        let mut seen = std::collections::HashSet::new();
+        for problem in [
+            NoDevice,
+            PermissionDenied,
+            Disconnected,
+            Busy,
+            NoSoundServer,
+            Other,
+        ] {
+            assert!(seen.insert(MicError::new(problem, "x").message(false)));
+        }
+        assert!(
+            MicError::new(Other, "disk on fire")
+                .message(false)
+                .contains("disk on fire")
+        );
+    }
+
+    /// A glitch or a route change leaves the stream working, so it must not end the recording.
+    #[test]
+    fn harmless_stream_errors_do_not_end_the_recording() {
+        use cpal::ErrorKind as K;
+        let slot = Mutex::new(None);
+        for kind in [K::Xrun, K::DeviceChanged, K::RealtimeDenied] {
+            record_stream_error(&slot, &cpal::Error::new(kind));
+        }
+        assert_eq!(take_stream_error(&slot), None);
+        for kind in [
+            K::DeviceNotAvailable,
+            K::PermissionDenied,
+            K::HostUnavailable,
+            K::StreamInvalidated,
+            K::BackendError,
+        ] {
+            assert!(ends_recording(kind), "{kind:?}");
+        }
+    }
+
+    /// The typed error survives being returned as an `anyhow::Error`, so callers can recognise it.
+    #[test]
+    fn a_microphone_error_can_be_recognised_in_an_anyhow_error() {
+        let error: anyhow::Error = MicError::new(MicProblem::NoDevice, "").into();
+        assert_eq!(
+            error.downcast_ref::<MicError>().map(MicError::problem),
+            Some(MicProblem::NoDevice)
+        );
+        assert_eq!(
+            error.to_string(),
+            MicError::new(MicProblem::NoDevice, "").message(cfg!(target_os = "macos"))
+        );
     }
 
     /// Two bursts of speech separated by a pause longer than the silence limit must come out

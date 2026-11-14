@@ -8,7 +8,8 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 pub async fn run(settings: Settings) -> Result<()> {
-    let mut recorder = AudioRecorder::new(settings.min_threshold, settings.verbose);
+    let mut recorder = AudioRecorder::new(settings.min_threshold, settings.verbose)
+        .with_device(settings.input_device.clone());
 
     println!("Press Enter to start recording...");
     io::stdin().read_line(&mut String::new())?;

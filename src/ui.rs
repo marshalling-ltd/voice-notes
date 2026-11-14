@@ -15,9 +15,10 @@
 //!  Enter start/stop · c clean · ↑↓ scroll · q quit
 //! ```
 
-use crate::audio::AudioRecorder;
+use crate::audio::{AudioRecorder, MicError};
 use crate::chat::{Conversation, ReplyDelta};
 use crate::config::Config;
+use crate::devices::{self, DeviceInfo, Direction};
 use crate::endpoints::Endpoints;
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
 use crate::setup::{self, Choice, Findings};
@@ -135,6 +136,13 @@ pub enum Action {
     SkipSetup,
     /// Switch to the named profile.
     SwitchProfile(String),
+    /// Look for the microphones and speakers and open the device chooser.
+    OpenDevices,
+    /// Use and save these devices (`None` is the system default).
+    SaveDevices {
+        input: Option<String>,
+        output: Option<String>,
+    },
 }
 
 /// Turns a saved config into the settings the session runs with.
@@ -168,6 +176,75 @@ pub struct Chooser {
     pub focus: usize,
 }
 
+/// One row of the device chooser: a microphone or a speaker, with the choices to cycle through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceRow {
+    pub direction: Direction,
+    pub devices: Vec<DeviceInfo>,
+    /// 0 is "System default"; `n` is `devices[n - 1]`.
+    pub selected: usize,
+}
+
+impl DeviceRow {
+    /// The row for `direction`, with `current` (an id or a name from the config or a flag) chosen
+    /// if it matches a device, else the system default.
+    #[must_use]
+    pub fn new(direction: Direction, devices: Vec<DeviceInfo>, current: Option<&str>) -> Self {
+        let selected = match devices::plan(&devices, current) {
+            devices::Pick::Device(id) => {
+                devices.iter().position(|d| d.id == id).map_or(0, |i| i + 1)
+            }
+            _ => 0,
+        };
+        Self {
+            direction,
+            devices,
+            selected,
+        }
+    }
+
+    /// The id to save: `None` for the system default.
+    #[must_use]
+    pub fn chosen(&self) -> Option<String> {
+        self.selected
+            .checked_sub(1)
+            .and_then(|i| self.devices.get(i))
+            .map(|d| d.id.clone())
+    }
+
+    /// What the row shows: the name, or "System default" with what that currently is.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self
+            .selected
+            .checked_sub(1)
+            .and_then(|i| self.devices.get(i))
+        {
+            Some(device) => device.name.clone(),
+            None => match self.devices.iter().find(|d| d.is_default) {
+                Some(default) => format!("System default ({})", default.name),
+                None => "System default".to_string(),
+            },
+        }
+    }
+
+    fn next(&mut self) {
+        self.selected = (self.selected + 1) % (self.devices.len() + 1);
+    }
+
+    fn previous(&mut self) {
+        self.selected = (self.selected + self.devices.len()) % (self.devices.len() + 1);
+    }
+}
+
+/// The device chooser: a microphone row and a speaker row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceChooser {
+    /// The microphone row, then the speaker row.
+    pub rows: [DeviceRow; 2],
+    pub focus: usize,
+}
+
 /// Everything the screen shows.
 // The bools are independent facts (speaking, clean, quit, speech on), not one state.
 #[allow(clippy::struct_excessive_bools)]
@@ -194,6 +271,8 @@ pub struct App {
     pub setup: Option<SetupState>,
     /// The model chooser, opened from the setup screen.
     pub chooser: Option<Chooser>,
+    /// The microphone and speaker chooser.
+    pub devices: Option<DeviceChooser>,
     /// The profile in use, and every profile `p` can switch to.
     pub profile: String,
     pub profiles: Vec<String>,
@@ -222,6 +301,7 @@ impl App {
             backend_label: String::new(),
             setup: None,
             chooser: None,
+            devices: None,
             profile: String::new(),
             profiles: Vec::new(),
             speak_enabled: true,
@@ -428,11 +508,15 @@ impl App {
         if self.setup.is_some() {
             return self.on_setup_key(key);
         }
+        if self.devices.is_some() {
+            return self.on_devices_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('u') if self.idle() => return Some(Action::OpenSetup),
+            KeyCode::Char('d') if self.idle() => return Some(Action::OpenDevices),
             KeyCode::Char('p') if self.idle() => {
                 return self.next_profile().map(Action::SwitchProfile);
             }
@@ -564,6 +648,35 @@ impl App {
         self.chooser = Some(chooser);
     }
 
+    /// Keys while the device chooser is open.
+    fn on_devices_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let chooser = self.devices.as_mut()?;
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => self.devices = None,
+            KeyCode::Up | KeyCode::Char('k') => chooser.focus = chooser.focus.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => chooser.focus = (chooser.focus + 1).min(1),
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('l' | ' ') => {
+                chooser.rows[chooser.focus].next();
+            }
+            KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
+                chooser.rows[chooser.focus].previous();
+            }
+            KeyCode::Enter => {
+                let action = Action::SaveDevices {
+                    input: chooser.rows[0].chosen(),
+                    output: chooser.rows[1].chosen(),
+                };
+                self.devices = None;
+                return Some(action);
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Update what the header shows after the settings changed.
     pub fn reconfigure(&mut self, backend_label: String, speak_enabled: bool, cloud: bool) {
         self.backend_label = backend_label;
@@ -619,17 +732,55 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_setup(frame, setup, app.chooser.as_ref());
         return;
     }
-    let [header, meter, body, footer] = Layout::vertical([
+    if let Some(devices) = &app.devices {
+        draw_devices(frame, devices, app.notice.as_deref());
+        return;
+    }
+    let [header, meter, body, warnings, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(5),
         Constraint::Min(5),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(frame.area());
     draw_header(frame, header, app);
     draw_meter(frame, meter, app);
     draw_body(frame, body, app);
+    draw_warnings(frame, warnings, app);
     draw_footer(frame, footer, app);
+}
+
+/// Shorten `text` to at most `width` columns, ending in `…` if anything was cut.
+fn fit(text: &str, width: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= width {
+        return flat;
+    }
+    let keep = width.saturating_sub(1);
+    let mut cut: String = flat.chars().take(keep).collect();
+    if width > 0 {
+        cut.push('…');
+    }
+    cut
+}
+
+/// The warnings line: problems such as a missing microphone or a speech service that is down.
+/// It always has a row of its own, so a message is never squeezed out by the key hints, and the
+/// layout does not jump when one appears.
+fn draw_warnings(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(notice) = &app.notice else {
+        return;
+    };
+    let text = fit(
+        &format!("⚠ {notice}"),
+        usize::from(area.width).saturating_sub(2),
+    );
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(text, Style::new().fg(BAD).add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn panel(title: &str) -> Block<'_> {
@@ -1062,6 +1213,93 @@ fn setup_state(found: &Findings) -> SetupState {
 }
 
 /// The model chooser screen.
+/// The microphone and speaker chooser, in the style of the model chooser.
+fn draw_devices(frame: &mut Frame, chooser: &DeviceChooser, notice: Option<&str>) {
+    let [body, warnings, footer] = Layout::vertical([
+        Constraint::Min(5),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    let block = panel("Voice Notes · Choose audio devices");
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Pick the microphone and the speaker. Your choice is saved and used straight away.",
+            Style::new().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            "Replies spoken by the system voice (the fallback) always use the default speaker.",
+            Style::new().fg(DIM),
+        )),
+        Line::default(),
+    ];
+    // The row label takes 14 columns, the arrows and margins 6.
+    let room = usize::from(inner.width).saturating_sub(20);
+    for (i, row) in chooser.rows.iter().enumerate() {
+        let focused = i == chooser.focus;
+        let label = match row.direction {
+            Direction::Input => "Microphone",
+            Direction::Output => "Speaker",
+        };
+        let name_style = if focused {
+            Style::new().fg(GOOD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if focused { "▶ " } else { "  " }, Style::new().fg(ACCENT)),
+            Span::styled(
+                format!("{label:<12}"),
+                Style::new().fg(if focused { ACCENT } else { Color::White }),
+            ),
+            Span::styled("‹ ", Style::new().fg(DIM)),
+            Span::styled(fit(&row.label(), room), name_style),
+            Span::styled(" ›", Style::new().fg(DIM)),
+        ]));
+        if row.devices.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("                 no {} found", row.direction.noun()),
+                Style::new().fg(WARN),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+    if let Some(notice) = notice {
+        let text = fit(
+            &format!("⚠ {notice}"),
+            usize::from(warnings.width).saturating_sub(2),
+        );
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(text, Style::new().fg(BAD).add_modifier(Modifier::BOLD)),
+        ]);
+        frame.render_widget(Paragraph::new(line), warnings);
+    }
+
+    let keys = [
+        ("↑↓", " row"),
+        ("←→", " change"),
+        ("Enter", " save"),
+        ("Esc", " cancel"),
+        ("q", " quit"),
+    ];
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, what)) in keys.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::new().fg(DIM)));
+        }
+        spans.push(Span::styled(
+            key,
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(what, Style::new().fg(DIM)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), footer);
+}
+
 fn draw_chooser(frame: &mut Frame, chooser: &Chooser) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(frame.area());
@@ -1130,13 +1368,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Phase::Finishing | Phase::Cleaning | Phase::Thinking => " wait",
         Phase::Idle | Phase::Done => " start",
     };
-    let sep = || text(" · ");
+    // Two spaces between the hints: with the device key the line would not fit 80 columns
+    // otherwise.
+    let sep = || Span::raw("  ");
     let mut spans = vec![Span::raw(" "), key("Enter"), text(action)];
     if app.idle() {
         spans.extend([
             sep(),
             key("u"),
             text(" setup"),
+            sep(),
+            key("d"),
+            text(" devices"),
             sep(),
             key("p"),
             text(" profile"),
@@ -1156,11 +1399,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         spans.extend([sep(), key("c"), text(" clean")]);
     }
     spans.extend([sep(), key("↑↓"), sep(), key("q"), text(" quit")]);
-    if let Some(notice) = &app.notice {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(notice.clone(), Style::new().fg(BAD)));
-    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The warning for a failed recording. A microphone problem already says what to do about it
+/// (and must fit the one-line warnings area), so it is shown as it is; anything else gets
+/// `what` in front of it.
+fn recorder_notice(what: &str, error: &anyhow::Error) -> String {
+    match error.downcast_ref::<MicError>() {
+        Some(mic) => mic.to_string(),
+        None => format!("{what}: {error:#}"),
+    }
 }
 
 /// Run the interface until the user quits; returns the text to print afterwards.
@@ -1198,6 +1447,10 @@ struct Session {
     text_seen: bool,
     /// The saved config in use, for resolving profiles.
     config: Config,
+    /// The microphone and speaker in use (an id or a name; `None` is the system default). A
+    /// choice made in the app wins over flags and over what a settings change resolves.
+    input_device: Option<String>,
+    output_device: Option<String>,
     /// Looking around for models and services (setup screen).
     probe_task: Option<JoinHandle<Findings>>,
     /// Builds settings from a freshly saved config.
@@ -1211,7 +1464,8 @@ impl Session {
             spawn_transcriber(client.clone(), Self::transcribe_options(settings));
         let (deltas_tx, deltas_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            recorder: AudioRecorder::new(settings.min_threshold, false),
+            recorder: AudioRecorder::new(settings.min_threshold, false)
+                .with_device(settings.input_device.clone()),
             speaker: Speaker::new(settings.speech.clone()),
             client,
             jobs,
@@ -1227,6 +1481,8 @@ impl Session {
             silenced: false,
             text_seen: false,
             config,
+            input_device: settings.input_device.clone(),
+            output_device: settings.speech.output_device.clone(),
             probe_task: None,
             resolve,
         }
@@ -1274,7 +1530,7 @@ impl Session {
                 );
             }
             Err(e) => {
-                app.notice = Some(format!("recording failed: {e:#}"));
+                app.notice = Some(recorder_notice("recording failed", &e));
                 let _ = self.recorder.stop_recording();
                 app.phase = Phase::Idle;
             }
@@ -1297,8 +1553,13 @@ impl Session {
     async fn act(&mut self, app: &mut App, action: Action) {
         match action {
             Action::Start => match self.recorder.start_recording() {
-                Ok(()) => app.begin(),
-                Err(e) => app.notice = Some(format!("cannot start: {e:#}")),
+                Ok(()) => {
+                    app.begin();
+                    if let Some(notice) = self.recorder.take_notice() {
+                        app.notice = Some(notice);
+                    }
+                }
+                Err(e) => app.notice = Some(recorder_notice("cannot start", &e)),
             },
             Action::Stop => self.stop_recording(app),
             Action::Skip => {
@@ -1320,7 +1581,48 @@ impl Session {
             Action::SaveSetup => self.save_setup(app),
             Action::SkipSetup => self.skip_setup(app),
             Action::SwitchProfile(name) => self.switch_profile(app, &name),
+            Action::OpenDevices => self.open_devices(app),
+            Action::SaveDevices { input, output } => self.save_devices(app, input, output),
         }
+    }
+
+    /// Look for the microphones and speakers and open the chooser.
+    fn open_devices(&mut self, app: &mut App) {
+        match (
+            devices::list(Direction::Input),
+            devices::list(Direction::Output),
+        ) {
+            (Ok(inputs), Ok(outputs)) => {
+                app.notice = None;
+                app.devices = Some(DeviceChooser {
+                    rows: [
+                        DeviceRow::new(Direction::Input, inputs, self.input_device.as_deref()),
+                        DeviceRow::new(Direction::Output, outputs, self.output_device.as_deref()),
+                    ],
+                    focus: 0,
+                });
+            }
+            (Err(e), _) | (_, Err(e)) => app.notice = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Use the chosen devices from now on and save them, so they survive a restart.
+    fn save_devices(&mut self, app: &mut App, input: Option<String>, output: Option<String>) {
+        self.use_devices(input.clone(), output.clone());
+        self.config.input_device = input;
+        self.config.output_device = output;
+        app.notice = match self.config.save() {
+            Ok(_) => None,
+            Err(e) => Some(format!("not saved: {e:#}")),
+        };
+    }
+
+    /// Switch the microphone and the speaker, for the next recording and the next reply.
+    fn use_devices(&mut self, input: Option<String>, output: Option<String>) {
+        self.recorder.set_device(input.clone());
+        self.speaker.set_output_device(output.clone());
+        self.input_device = input;
+        self.output_device = output;
     }
 
     /// Switch to another profile; the conversation starts afresh with the new model and prompt.
@@ -1397,6 +1699,8 @@ impl Session {
         self.conversation = Arc::new(Mutex::new(Self::conversation(settings)));
         self.speaker.stop();
         self.speaker = Speaker::new(settings.speech.clone());
+        // Devices chosen in the app outlive a change of settings.
+        self.speaker.set_output_device(self.output_device.clone());
         // A new speech-to-text model or address needs a new worker. The old one finishes what it
         // is doing and stops when its sender is dropped; this runs only while nothing is being
         // transcribed (setup and profile switching are available only when idle).
@@ -1739,6 +2043,151 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
+    }
+
+    const NO_MICROPHONE: &str =
+        "recording failed: no default input device found (is a microphone available?)";
+
+    /// The problem found in the audit of #14 to #19: at 80 columns the key hints used up the
+    /// footer and a microphone error showed as a single letter. A warning now has a row of its own.
+    #[test]
+    fn a_long_warning_is_fully_visible_at_80_columns() {
+        let mut app = App::new(false);
+        app.notice = Some(NO_MICROPHONE.to_string());
+        let rows = render(&app);
+        assert_eq!(rows.len(), 24);
+        let warning = rows
+            .iter()
+            .position(|r| r.contains("no default input device"))
+            .unwrap();
+        assert!(
+            rows[warning].contains(NO_MICROPHONE),
+            "cut off: {:?}",
+            rows[warning]
+        );
+        assert!(rows[warning].contains('⚠'));
+        // Between the panes and the key hints, on a row that holds nothing else.
+        assert_eq!(
+            warning,
+            22,
+            "one row above the footer:\n{}",
+            rows.join("\n")
+        );
+        assert!(!rows[warning].contains("Enter"));
+    }
+
+    /// The key hints are complete whether or not there is a warning.
+    #[test]
+    fn key_hints_are_unaffected_by_a_warning() {
+        let mut app = App::new(false);
+        let clean = render(&app);
+        app.notice = Some(NO_MICROPHONE.to_string());
+        let warned = render(&app);
+        assert_eq!(clean[23], warned[23]);
+        assert!(warned[23].contains("quit"), "{:?}", warned[23]);
+    }
+
+    /// Without a warning the row stays empty and nothing else moves.
+    #[test]
+    fn no_warning_leaves_the_row_empty() {
+        let rows = render(&App::new(false));
+        assert_eq!(rows[22].trim(), "");
+        assert!(!rows.join("\n").contains('⚠'));
+    }
+
+    /// Talk mode has the same warnings row.
+    #[test]
+    fn talk_mode_shows_the_warning_too() {
+        let mut app = App::new(false).with_talk(true, "qwen3-8b".into(), true);
+        app.notice = Some("speech service is down; using the system voice".to_string());
+        let rows = render(&app);
+        assert!(
+            rows[22].contains("⚠ speech service is down; using the system voice"),
+            "{:?}",
+            rows[22]
+        );
+    }
+
+    /// A message too long for the line is cut with an ellipsis, not wrapped over other panes.
+    #[test]
+    fn an_overlong_warning_is_shortened_to_one_row() {
+        let mut app = App::new(false);
+        app.notice = Some("x".repeat(300));
+        let rows = render(&app);
+        assert!(rows[22].trim_end().ends_with('…'), "{:?}", rows[22]);
+        assert!(rows[22].chars().count() <= 80);
+        assert!(
+            rows[21].contains('╯') || rows[21].contains('─'),
+            "the body border is intact"
+        );
+    }
+
+    #[test]
+    fn fit_shortens_and_flattens() {
+        assert_eq!(fit("short", 10), "short");
+        assert_eq!(fit("exactly ten", 11), "exactly ten");
+        assert_eq!(fit("abcdefghijkl", 8), "abcdefg…");
+        assert_eq!(fit("two\nlines  here", 20), "two lines here");
+        assert_eq!(fit("anything", 1), "…");
+        assert_eq!(fit("anything", 0), "");
+    }
+
+    /// Microphone problems appear as the message alone, whole, on the warnings line.
+    #[test]
+    fn every_microphone_problem_is_shown_in_full_on_the_warnings_line() {
+        use crate::audio::MicProblem::{
+            Busy, Disconnected, NoDevice, NoSoundServer, Other, PermissionDenied,
+        };
+        for problem in [
+            NoDevice,
+            PermissionDenied,
+            Disconnected,
+            Busy,
+            NoSoundServer,
+            Other,
+        ] {
+            let error: anyhow::Error = MicError::new(problem, "stream failed").into();
+            let mut app = App::new(false);
+            app.notice = Some(recorder_notice("recording failed", &error));
+            let rows = render(&app);
+            assert!(
+                rows[22].contains(&format!("⚠ {error}")),
+                "{problem:?}: {:?}",
+                rows[22]
+            );
+            assert!(
+                !rows[22].contains('…'),
+                "{problem:?} was cut: {:?}",
+                rows[22]
+            );
+        }
+    }
+
+    /// Other failures keep their explanation in front of the system's words.
+    #[test]
+    fn other_recording_errors_keep_a_prefix() {
+        let error = anyhow::anyhow!("poisoned lock");
+        assert_eq!(
+            recorder_notice("recording failed", &error),
+            "recording failed: poisoned lock"
+        );
+        let wrapped = anyhow::anyhow!("inner").context("outer");
+        assert_eq!(
+            recorder_notice("cannot start", &wrapped),
+            "cannot start: outer: inner"
+        );
+    }
+
+    /// A microphone error is recognised even when something added context around it.
+    #[test]
+    fn a_microphone_error_with_context_is_still_recognised() {
+        use crate::audio::MicProblem;
+        let error =
+            anyhow::Error::new(MicError::new(MicProblem::Busy, "")).context("while starting");
+        assert_eq!(
+            recorder_notice("cannot start", &error),
+            MicError::new(MicProblem::Busy, "").to_string()
+        );
     }
 
     /// While listening the screen shows transcribed, pending and filtered entries.
@@ -2642,6 +3091,7 @@ mod session_tests {
             min_threshold: 0.01,
             language: Some("en".into()),
             verbose: false,
+            input_device: None,
             endpoints: Endpoints {
                 stt: stt_url.into(),
                 ..Endpoints::default()
@@ -2663,6 +3113,29 @@ mod session_tests {
 
     fn unused_resolver() -> Resolver {
         Arc::new(|_, _| anyhow::bail!("not used in this test"))
+    }
+
+    /// A device chosen in the app is used for the next recording and reply, and a change of
+    /// settings afterwards (a profile switch, setup) does not bring the old one back.
+    #[tokio::test]
+    async fn devices_chosen_in_the_app_survive_a_settings_change() {
+        let mut launch = settings("http://127.0.0.1:1/stt", "w", "c");
+        launch.input_device = Some("from-a-flag".into());
+        launch.speech.output_device = Some("flag-speaker".into());
+        let mut session = Session::new(&launch, unused_resolver(), Config::default());
+        assert_eq!(session.input_device.as_deref(), Some("from-a-flag"));
+
+        session.use_devices(Some("usb-mic".into()), None);
+        assert_eq!(session.input_device.as_deref(), Some("usb-mic"));
+        assert_eq!(
+            session.output_device, None,
+            "the system default is a choice too"
+        );
+
+        let mut app = App::new(false);
+        session.apply(&mut app, &launch); // still carries the flags
+        assert_eq!(session.input_device.as_deref(), Some("usb-mic"));
+        assert_eq!(session.output_device, None);
     }
 
     /// After new settings are applied, speech is transcribed at the new address with the new
@@ -2716,5 +3189,315 @@ mod session_tests {
         assert_eq!(session.endpoints.stt, "http://127.0.0.1:1/b");
         assert_eq!(session.clean_model, "new-clean");
         assert_eq!(app.profile, "fast");
+    }
+}
+
+/// The microphone and speaker chooser.
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn device(id: &str, name: &str, is_default: bool) -> DeviceInfo {
+        DeviceInfo {
+            id: id.into(),
+            name: name.into(),
+            is_default,
+        }
+    }
+
+    fn mics() -> Vec<DeviceInfo> {
+        vec![
+            device("m1", "Built-in Microphone", true),
+            device("m2", "Blue Yeti USB Microphone", false),
+        ]
+    }
+
+    fn speakers() -> Vec<DeviceInfo> {
+        vec![
+            device("s1", "Built-in Speakers", true),
+            device("s2", "USB Headset", false),
+        ]
+    }
+
+    fn chooser(input: Option<&str>, output: Option<&str>) -> DeviceChooser {
+        DeviceChooser {
+            rows: [
+                DeviceRow::new(Direction::Input, mics(), input),
+                DeviceRow::new(Direction::Output, speakers(), output),
+            ],
+            focus: 0,
+        }
+    }
+
+    fn app_with(chooser: DeviceChooser) -> App {
+        let mut app = App::new(false);
+        app.devices = Some(chooser);
+        app
+    }
+
+    fn render(app: &App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    // ---- opening
+
+    #[test]
+    fn d_opens_the_chooser_only_when_idle() {
+        let mut app = App::new(false);
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('d'))),
+            Some(Action::OpenDevices)
+        );
+        app.begin(); // recording
+        assert_eq!(app.on_key(press(KeyCode::Char('d'))), None);
+    }
+
+    // ---- choosing
+
+    #[test]
+    fn rows_start_on_the_current_choice() {
+        let row = DeviceRow::new(Direction::Input, mics(), Some("m2"));
+        assert_eq!(row.chosen().as_deref(), Some("m2"));
+        let by_name = DeviceRow::new(Direction::Input, mics(), Some("blue yeti"));
+        assert_eq!(by_name.chosen().as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn an_unset_or_unknown_choice_starts_on_the_system_default() {
+        assert_eq!(
+            DeviceRow::new(Direction::Input, mics(), None).chosen(),
+            None
+        );
+        assert_eq!(
+            DeviceRow::new(Direction::Input, mics(), Some("unplugged")).chosen(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_default_row_says_what_the_default_is() {
+        let row = DeviceRow::new(Direction::Output, speakers(), None);
+        assert_eq!(row.label(), "System default (Built-in Speakers)");
+        assert_eq!(
+            DeviceRow::new(Direction::Output, vec![], None).label(),
+            "System default"
+        );
+    }
+
+    #[test]
+    fn left_and_right_cycle_through_the_default_and_every_device() {
+        let mut app = app_with(chooser(None, None));
+        let chosen = |app: &App| app.devices.as_ref().unwrap().rows[0].chosen();
+        assert_eq!(chosen(&app), None);
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(chosen(&app).as_deref(), Some("m1"));
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(chosen(&app).as_deref(), Some("m2"));
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(chosen(&app), None, "wraps round to the default");
+        app.on_key(press(KeyCode::Left));
+        assert_eq!(chosen(&app).as_deref(), Some("m2"), "and back");
+    }
+
+    #[test]
+    fn up_and_down_move_between_the_rows_and_stop_at_the_ends() {
+        let mut app = app_with(chooser(None, None));
+        let focus = |app: &App| app.devices.as_ref().unwrap().focus;
+        app.on_key(press(KeyCode::Up));
+        assert_eq!(focus(&app), 0);
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(focus(&app), 1);
+        app.on_key(press(KeyCode::Right)); // the speaker row now
+        let rows = &app.devices.as_ref().unwrap().rows;
+        assert_eq!(rows[0].chosen(), None, "the microphone row did not move");
+        assert_eq!(rows[1].chosen().as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn enter_saves_both_choices_and_closes() {
+        let mut app = app_with(chooser(Some("m2"), None));
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Right));
+        app.on_key(press(KeyCode::Right));
+        let action = app.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            action,
+            Some(Action::SaveDevices {
+                input: Some("m2".into()),
+                output: Some("s2".into())
+            })
+        );
+        assert!(app.devices.is_none());
+    }
+
+    #[test]
+    fn choosing_the_default_saves_nothing_so_the_config_key_is_removed() {
+        let mut app = app_with(chooser(Some("m2"), Some("s2")));
+        app.on_key(press(KeyCode::Right)); // m2 -> default
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Right)); // s2 -> default
+        assert_eq!(
+            app.on_key(press(KeyCode::Enter)),
+            Some(Action::SaveDevices {
+                input: None,
+                output: None
+            })
+        );
+    }
+
+    #[test]
+    fn escape_cancels_without_saving() {
+        let mut app = app_with(chooser(None, None));
+        app.on_key(press(KeyCode::Right));
+        assert_eq!(app.on_key(press(KeyCode::Esc)), None);
+        assert!(app.devices.is_none());
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit_the_app_from_the_chooser() {
+        let mut app = app_with(chooser(None, None));
+        app.on_key(press(KeyCode::Char('q')));
+        assert!(app.quit);
+        let mut app = app_with(chooser(None, None));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn keys_that_mean_something_elsewhere_do_nothing_in_the_chooser() {
+        let mut app = app_with(chooser(None, None));
+        assert_eq!(app.on_key(press(KeyCode::Char('t'))), None);
+        assert_eq!(
+            app.mode,
+            Mode::Notes,
+            "t must not switch to talk mode behind the chooser"
+        );
+        assert_eq!(app.on_key(press(KeyCode::Char('d'))), None);
+        assert!(app.devices.is_some());
+    }
+
+    #[test]
+    fn a_chooser_with_no_devices_does_not_panic_on_any_key() {
+        let empty = DeviceChooser {
+            rows: [
+                DeviceRow::new(Direction::Input, vec![], None),
+                DeviceRow::new(Direction::Output, vec![], None),
+            ],
+            focus: 0,
+        };
+        let mut app = app_with(empty);
+        for code in [
+            KeyCode::Right,
+            KeyCode::Left,
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+        ] {
+            app.on_key(press(code));
+        }
+        assert_eq!(
+            app.on_key(press(KeyCode::Enter)),
+            Some(Action::SaveDevices {
+                input: None,
+                output: None
+            })
+        );
+    }
+
+    // ---- drawing
+
+    #[test]
+    fn the_chooser_shows_both_rows_with_their_current_choice() {
+        let rows = render(&app_with(chooser(Some("m2"), None)));
+        let text = rows.join("\n");
+        assert!(text.contains("Choose audio devices"), "{text}");
+        let mic = rows.iter().find(|r| r.contains("Microphone ")).unwrap();
+        assert!(
+            mic.contains("▶") && mic.contains("‹ Blue Yeti USB Microphone ›"),
+            "{mic:?}"
+        );
+        let speaker = rows.iter().find(|r| r.contains("Speaker ")).unwrap();
+        assert!(
+            speaker.contains("‹ System default (Built-in Speakers) ›"),
+            "{speaker:?}"
+        );
+        assert!(
+            !speaker.contains('▶'),
+            "only the focused row has the marker"
+        );
+        for hint in ["Enter", "save", "Esc", "cancel", "quit"] {
+            assert!(rows[23].contains(hint), "{hint} missing in {:?}", rows[23]);
+        }
+    }
+
+    #[test]
+    fn a_very_long_device_name_is_cut_to_fit_the_row() {
+        let long = "A".repeat(200);
+        let mut chooser = chooser(None, None);
+        chooser.rows[0] =
+            DeviceRow::new(Direction::Input, vec![device("x", &long, false)], Some("x"));
+        let rows = render(&app_with(chooser));
+        let mic = rows.iter().find(|r| r.contains("Microphone ")).unwrap();
+        assert!(
+            mic.contains('…') && mic.contains('›'),
+            "the arrow must stay visible: {mic:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_kind_of_device_is_called_out() {
+        let mut chooser = chooser(None, None);
+        chooser.rows[1] = DeviceRow::new(Direction::Output, vec![], None);
+        let text = render(&app_with(chooser)).join("\n");
+        assert!(text.contains("no speaker found"), "{text}");
+    }
+
+    #[test]
+    fn a_warning_shows_on_the_chooser_screen() {
+        let mut app = app_with(chooser(None, None));
+        app.notice = Some("not saved: permission denied".into());
+        let rows = render(&app);
+        assert!(
+            rows[22].contains("⚠ not saved: permission denied"),
+            "{:?}",
+            rows[22]
+        );
+    }
+
+    // ---- the key hints on the main screen
+
+    #[test]
+    fn the_main_footer_offers_devices_and_still_fits_80_columns() {
+        for talk in [false, true] {
+            let app = if talk {
+                App::new(false).with_talk(true, "m".into(), true)
+            } else {
+                App::new(false)
+            };
+            let footer = render(&app)[23].clone();
+            assert!(footer.contains("d devices"), "{footer:?}");
+            assert!(
+                footer.contains("q quit"),
+                "the last hint was cut off: {footer:?}"
+            );
+            assert!(footer.contains("Enter start"), "{footer:?}");
+        }
     }
 }

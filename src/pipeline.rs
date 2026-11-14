@@ -19,6 +19,8 @@ pub struct Settings {
     pub language: Option<String>,
     /// Print the live input level (plain mode only).
     pub verbose: bool,
+    /// The microphone to record from: a device id or a name; `None` is the system default.
+    pub input_device: Option<String>,
     /// Where the services live.
     pub endpoints: Endpoints,
     /// Model name sent to the speech-to-text endpoint.

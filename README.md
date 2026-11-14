@@ -19,7 +19,7 @@ Speak and get text, or speak and get an answer back. Runs on **Linux** and **mac
 | --- | --- | --- |
 | Rust | nightly (see `make requirements`) | nightly |
 | Audio | `libasound2-dev pkg-config build-essential` to build | nothing extra |
-| Playback | one of `paplay`, `pw-play`, `aplay` | `afplay` (built in) |
+| Playback | nothing extra (a sound server: PipeWire or PulseAudio) | nothing extra |
 | System voice | `espeak-ng` | `say` (built in) |
 
 You also need an OpenAI-compatible server on `127.0.0.1:8080` serving Whisper (`/v1/audio/transcriptions`) and, for talk mode and `--clean`, a chat model (`/v1/chat/completions`).
@@ -38,7 +38,7 @@ cargo run -- setup                  # find your models and services and save the
 cargo run -- --plain                # line-by-line interface (also used when not in a terminal)
 ```
 
-Keys: `Enter` start/stop (or skip speech), `p` next profile, `t` notes/talk, `r` read aloud, `u` setup, `c` clean (notes), `n` new conversation (talk), `↑↓` scroll, `q` quit.
+Keys: `Enter` start/stop (or skip speech), `p` next profile, `t` notes/talk, `r` read aloud, `u` setup, `d` audio devices, `c` clean (notes), `n` new conversation (talk), `↑↓` scroll, `q` quit.
 
 Other options: `--language hr` (spoken language, default `en`, `auto` to detect), `--threshold` (minimum speech level), `--no-speech` (text only), `--verbose` (with `--plain`, show the live input level). `--backend`, `--chat-model` and `--think` adjust the launch profile.
 
@@ -176,7 +176,21 @@ Saved settings live in `~/.config/voice-notes/config.toml` (Linux) or `~/Library
 
 If the server cannot be reached, the app says so once and switches to the system voice (`--voice`, default `en`), so talking keeps working. `--tts system` skips Kokoro entirely.
 
+### Microphone and speaker
+
+By default the app uses the system's default microphone and speaker. To use others, press `d` in the app: one row each for the microphone and the speaker, `←` `→` to change, `Enter` to save. The choice is saved in the config file and used again after a restart.
+
+```sh
+voice-notes devices                       # list them, with the default and the saved choice marked
+voice-notes --input-device "Blue Yeti"    # a device's id, its name, or a unique part of the name
+voice-notes --output-device pulseaudio:alsa_output.usb-headset
+```
+
+In the config file they are `input_device` and `output_device`. If a chosen device is not there (a USB microphone that is not plugged in today), the default is used and the warnings line says so, so yesterday's choice is never a dead end. Replies from Kokoro are played through the chosen speaker by the app itself on both Linux and macOS. The system voice (the fallback, `espeak-ng` or `say`) always uses the default speaker, because those tools cannot be pointed at another one. If the chosen speaker cannot be opened, the reply is played by the platform's own player (`paplay`, `pw-play`, `aplay` or `ffplay` on Linux, `afplay` on macOS) and a warning says why.
+
 ### Tuning
+
+Problems with the microphone appear in red on the line above the key hints, never as a crash: no microphone found, access denied (on macOS the message names the System Settings page; the permission is for the terminal app you run `voice-notes` in), the device unplugged or switched off while recording, or another program using it. A recording that was running stops, and pressing Enter starts again once the problem is fixed.
 
 If nothing appears while you speak, run `cargo run -- --plain --verbose` and compare the `ac-level` while speaking with the gate. If a quiet room reads very high, lower the microphone gain, for example `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.3` on Linux.
 
@@ -185,6 +199,8 @@ If nothing appears while you speak, run `cargo run -- --plain --verbose` and com
 | File | Purpose |
 | --- | --- |
 | `src/audio.rs` | Microphone capture, noise calibration, silence-based segmentation, WAV encoding |
+| `src/devices.rs` | Lists the microphones and speakers and finds the one chosen |
+| `src/playback.rs` | Plays a reply through the chosen speaker |
 | `src/transcribe.rs` | Whisper and chat HTTP calls, hallucination filter |
 | `src/chat.rs` | Conversation with a local model (streaming) or Claude, reasoning handling |
 | `src/profile.rs` | Profiles: fast, dev, smart, think, claude and your own |

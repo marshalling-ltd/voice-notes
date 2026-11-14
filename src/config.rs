@@ -37,6 +37,11 @@ pub struct Config {
     pub models_url: Option<String>,
     /// Model name sent to the speech-to-text endpoint.
     pub stt_model: Option<String>,
+    /// The microphone to record from: a device id (see `voice-notes devices`) or a name.
+    /// Absent means the system default.
+    pub input_device: Option<String>,
+    /// The speaker to play replies on: a device id or a name. Absent means the system default.
+    pub output_device: Option<String>,
     /// The profile used at launch (`fast` if absent).
     pub profile: Option<String>,
     /// The reasoning model behind the `smart` and `think` profiles.
@@ -160,6 +165,33 @@ mod tests {
             "an empty profile table is not written"
         );
         assert_eq!(Config::parse(&text).unwrap(), config);
+    }
+
+    /// The chosen microphone and speaker are saved, and read back after a restart.
+    #[test]
+    fn audio_devices_survive_a_restart() {
+        let config = Config {
+            input_device: Some("pulseaudio:alsa_input.usb-Blue_Yeti".into()),
+            output_device: Some("pulseaudio:alsa_output.pci-0000_66_00.6.analog-stereo".into()),
+            ..Config::default()
+        };
+        let text = config.render().unwrap();
+        assert!(
+            text.contains("input_device = \"pulseaudio:alsa_input.usb-Blue_Yeti\""),
+            "{text}"
+        );
+        assert!(text.contains("output_device = "), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), config);
+    }
+
+    /// Choosing the system default removes the keys instead of writing empty ones.
+    #[test]
+    fn the_system_default_is_not_written() {
+        let text = Config::default().render().unwrap();
+        assert!(!text.contains("device"), "{text}");
+        let hand_written = Config::parse("input_device = \"Blue Yeti\"\n").unwrap();
+        assert_eq!(hand_written.input_device.as_deref(), Some("Blue Yeti"));
+        assert_eq!(hand_written.output_device, None);
     }
 
     /// An empty file, or one with only some fields, is fine; junk is an error.
