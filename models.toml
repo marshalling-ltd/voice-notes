@@ -14,13 +14,15 @@
 #   size_bytes  exact size of the file
 #   licence     licence name, shown before anything is downloaded
 #   licence_url where to read it
+#   served_as   the model name the stack's llama-swap configs (stack/profiles) serve it under; the
+#               client saves this name as its model once the server serves the file
 #
 # Sizes and sha256 values are those published by the model host (checked 2026-11-14). Licences are
 # as stated on each model card; they were not independently audited.
 #
 # The default sets follow the project's hardware table: Whisper small with a 4B chat model for
 # `minimal`; Whisper large-v3-turbo with 8B for `light` and 14B for `standard`; and for `power`
-# Qwen3-Coder-30B-A3B as the fast model plus a reasoning model. Kokoro speaks in every class; its
+# Qwen3-Coder-30B-A3B as the fast model plus Qwen3.8-27B as the reasoning model. Kokoro speaks in every class; its
 # weights ship inside its container image, so the stack does not download this file (macOS does).
 # The stack's own sets (stack/profiles) are chosen for CPU speed and differ on purpose; see
 # stack/README.md.
@@ -38,6 +40,7 @@ sha256 = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
 size_bytes = 487601967
 licence = "MIT"
 licence_url = "https://github.com/openai/whisper/blob/main/LICENSE"
+served_as = "whisper"
 
 [[model]]
 id = "whisper-large-v3-turbo-q5_0"
@@ -49,6 +52,7 @@ sha256 = "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
 size_bytes = 574041195
 licence = "MIT"
 licence_url = "https://github.com/openai/whisper/blob/main/LICENSE"
+served_as = "whisper"
 
 [[model]]
 id = "qwen3-4b"
@@ -60,6 +64,7 @@ sha256 = "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a"
 size_bytes = 2497281312
 licence = "Apache-2.0"
 licence_url = "https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE"
+served_as = "qwen3-4b"
 
 [[model]]
 id = "qwen3-8b"
@@ -71,6 +76,7 @@ sha256 = "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4"
 size_bytes = 5027784512
 licence = "Apache-2.0"
 licence_url = "https://huggingface.co/Qwen/Qwen3-8B/blob/main/LICENSE"
+served_as = "qwen3-8b"
 
 [[model]]
 id = "qwen3-14b"
@@ -82,6 +88,7 @@ sha256 = "5eaa0870bd81ed3b58a630a271234cfa604e43ffb3a19cd68e54a80dd9d52a66"
 size_bytes = 9001753984
 licence = "Apache-2.0"
 licence_url = "https://huggingface.co/Qwen/Qwen3-14B/blob/main/LICENSE"
+served_as = "qwen3-14b"
 
 [[model]]
 id = "qwen3-coder-30b-a3b"
@@ -93,6 +100,19 @@ sha256 = "2841aa314d916434860cfb8990347528dcdfe5c350dbcb9d1461dbee88ff2533"
 size_bytes = 17665334432
 licence = "Apache-2.0"
 licence_url = "https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/LICENSE"
+served_as = "qwen3-coder-30b"
+
+[[model]]
+id = "qwen3.8-27b"
+name = "Qwen3.8 27B (UD-Q4_K_M)"
+role = "chat"
+class = "power"
+url = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4af51b3542f775b0a8e4b310bfb3f17e01c306c9/Qwen3.8-27B-UD-Q4_K_M.gguf"
+sha256 = "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529"
+size_bytes = 16564259744
+licence = "Apache-2.0"
+licence_url = "https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/LICENSE"
+served_as = "qwen-reasoner"
 
 [[model]]
 id = "kokoro-v1_0"
@@ -104,6 +124,7 @@ sha256 = "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4"
 size_bytes = 327212226
 licence = "Apache-2.0"
 licence_url = "https://huggingface.co/hexgrad/Kokoro-82M"
+served_as = "kokoro"
 
 # What each size class starts with, by job. A reasoning model is a chat model used for the
 # `smart` and `think` profiles; only `power` has room for one next to the fast model.
@@ -126,5 +147,5 @@ text-to-speech = "kokoro-v1_0"
 [sets.power]
 speech-to-text = "whisper-large-v3-turbo-q5_0"
 chat = "qwen3-coder-30b-a3b"
-reasoning = "qwen3-14b"
+reasoning = "qwen3.8-27b"
 text-to-speech = "kokoro-v1_0"

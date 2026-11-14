@@ -28,11 +28,11 @@ licence = "Apache-2.0"
 chosen = true
 
 [[model]]
-id = "qwen3-14b-q4_k_m"
+id = "qwen3.8-27b-ud-q4_k_m"
 role = "chat"
 class = "power"
-url = "https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/a04a82c4739b3ef5fa6da7d10261db2c67dd1985/Qwen3-14B-Q4_K_M.gguf"
-sha256 = "5eaa0870bd81ed3b58a630a271234cfa604e43ffb3a19cd68e54a80dd9d52a66"
-size_bytes = 9001753984
+url = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4af51b3542f775b0a8e4b310bfb3f17e01c306c9/Qwen3.8-27B-UD-Q4_K_M.gguf"
+sha256 = "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529"
+size_bytes = 16564259744
 licence = "Apache-2.0"
 chosen = true

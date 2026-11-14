@@ -19,6 +19,7 @@ Ticket #29 (VN-23): where do the catalogue's download URLs point for the first w
 | `unsloth/Qwen3-8B-GGUF` | `a6adef130ffb` |
 | `unsloth/Qwen3-14B-GGUF` | `a04a82c4739b` |
 | `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` | `b17cb02dd882` |
+| `unsloth/Qwen3.8-27B-GGUF` | `4af51b3542f7` |
 | `hexgrad/Kokoro-82M` | `f3ff3571791e` |
 
 To move to a newer version of a model, change the commit and the size and sha256 together, in `models.toml` and in the `stack/` catalogue files that list the same file (a test fails if they disagree; the sha256 is on the file's page on Hugging Face), and let the smoke test pass, like any other change.
@@ -27,7 +28,7 @@ To move to a newer version of a model, change the commit and the size and sha256
 
 - **The repository is deleted, renamed or made private.** Then the download fails with a clear error, because there is nothing to fetch. Commits survive normal edits, but not a deletion. This is the risk a mirror would remove.
 - **Hugging Face is down or slow.** Downloads fail or take long; models already downloaded are unaffected, because the volume keeps them.
-- **Whole-catalogue download volume.** The files for all profiles are about 35 GB, and one `power` install is 27 GB. Hugging Face serves these without limits that we have hit, but we did not test heavy parallel use, for example many CI runners at once. The CI models are small (430 MB) for that reason.
+- **Whole-catalogue download volume.** The files for all profiles are about 52 GB, and one `power` install is 35 GB. Hugging Face serves these without limits that we have hit, but we did not test heavy parallel use, for example many CI runners at once. The CI models are small (430 MB) for that reason.
 
 ## When to move to our own storage
 
