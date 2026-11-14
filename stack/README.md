@@ -41,6 +41,9 @@ Set these in the environment or in a `stack/.env` file.
 | `KOKORO_VERSION` | `v0.10.0` | Kokoro image tag. |
 | `LLAMA_SWAP_IMAGE` | `ghcr.io/mostlygeek/llama-swap:unified-vulkan` | llama-swap image. |
 | `MODELS_FILE` | `./ci-models.toml` | The models to download. |
+| `LLAMA_SWAP_CONFIG_FILE` | `./llama-swap.yaml` | The llama-swap configuration. It must match the models file, since it names the files to load. |
+
+Paths for `MODELS_FILE` and `LLAMA_SWAP_CONFIG_FILE` are relative to the `stack/` folder.
 
 To run next to an existing stack that already uses 8080 and 8880, change the ports and use a separate project name: `LLAMA_SWAP_PORT=18080 KOKORO_PORT=18880 docker compose -p test -f stack/compose.yaml up --wait`.
 
@@ -71,8 +74,32 @@ Two settings in `llama-swap.yaml` exist because the stack hit the problems they 
 - Images are pinned by tag, not by digest, so they can change under the same tag. Digest pinning is ticket #12.
 - To use other models, point `MODELS_FILE` at another file and edit `llama-swap.yaml` to match. Ready-made sets per machine size are ticket #10.
 
+## Smoke test
+
+`stack/smoke.sh` starts the stack, runs one full voice turn with `test-clip.wav` (a recording of "What is the capital of France?"), checks the result, and removes the stack again:
+
+```sh
+cargo build && stack/smoke.sh
+```
+
+It passes only if all of these hold, and prints one line for each:
+
+- the recording was transcribed, and the transcript mentions the capital or France;
+- the chat model answered;
+- the reply was streamed (it arrived in more than one piece);
+- the speech service returned audio.
+
+If anything fails it exits non-zero, says which stage failed, and saves the result of the turn and the logs of every service in `smoke-out/` (change it with `OUT_DIR`). Settings, such as another port or model set, are listed at the top of the script. A run with the CI models takes about 20 seconds on a machine that already has the images.
+
+CI runs it two ways:
+
+- `.github/workflows/smoke.yml` on every pull request and every push to `master`, with the small CI models. On a failure the saved logs are attached to the run as the `smoke-logs` artifact.
+- `.github/workflows/nightly.yml` every night with bigger models (`nightly-models.toml` and `llama-swap.nightly.yaml`: Whisper small and Qwen3-4B, about 3 GB), which catches changes in the upstream images and models early. Its logs are the `nightly-logs` artifact.
+
+`test-clip.wav` is 1.8 seconds of speech made with Kokoro (Apache-2.0) and converted to 16 kHz mono.
+
 ## Checks
 
 ```sh
-python3 -m unittest discover -s stack     # the model downloader, and that llama-swap.yaml matches the catalogue
+python3 -m unittest discover -s stack     # the model downloader, and that the llama-swap configs match their catalogues
 ```

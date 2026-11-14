@@ -1,0 +1,30 @@
+# Bigger models for the nightly smoke test (ticket #11): the `minimal` size class from the
+# catalogue, which is what a weak machine would really run. Used with llama-swap.nightly.yaml:
+#
+#   MODELS_FILE=./nightly-models.toml LLAMA_SWAP_CONFIG_FILE=./llama-swap.nightly.yaml
+#
+# Sizes and sha256 values are those published by the model host. Licences are as stated on each
+# model card; they were not independently audited.
+
+[meta]
+checked = "2026-11-14"
+
+[[model]]
+id = "whisper-small"
+role = "speech-to-text"
+class = "minimal"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+sha256 = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+size_bytes = 487601967
+licence = "MIT"
+chosen = true
+
+[[model]]
+id = "qwen3-4b-q4_k_m"
+role = "chat"
+class = "minimal"
+url = "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
+sha256 = "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a"
+size_bytes = 2497281312
+licence = "Apache-2.0"
+chosen = true

@@ -1,3 +1,5 @@
 /target
 /stack/.env
 __pycache__/
+/smoke-out/
+/smoke-out-nightly/

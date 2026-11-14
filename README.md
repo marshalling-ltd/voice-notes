@@ -94,7 +94,7 @@ Reply: The capital of France is Paris.
 Speech: 95178 bytes of audio received and discarded
 ```
 
-JSON output has `transcript`, `reply`, `speech` (`discarded`, `played` or `skipped`), `audio_bytes`, `speech_skipped_because`, `profile`, `backend` and `timings_ms` (`transcribe`, `chat`, `speech`).
+JSON output has `transcript`, `reply`, `reply_chunks` (how many pieces the reply arrived in; more than one means it was streamed), `speech` (`discarded`, `played` or `skipped`), `audio_bytes`, `speech_skipped_because`, `profile`, `backend` and `timings_ms` (`transcribe`, `chat`, `speech`).
 
 **Exit codes.** A failing turn prints which stage failed on stderr and exits with a code that names it:
 
@@ -209,7 +209,7 @@ If nothing appears while you speak, run `cargo run -- --plain --verbose` and com
    make check          # cargo update/upgrade, machete, audit, deny, typos, fmt, clippy pedantic, tests
    ```
 
-3. Branch off `upstream/master`, make a focused change with tests, **run `make check` before every push**, push to your fork and open a pull request against `master`. CI runs the same checks on Linux and macOS and must pass.
+3. Branch off `upstream/master`, make a focused change with tests, **run `make check` before every push**, push to your fork and open a pull request against `master`. CI runs the same checks on Linux and macOS and must pass. A smoke test also runs the whole voice loop against the service stack in `stack/` (see `stack/README.md`); you can run it yourself with `cargo build && stack/smoke.sh` if Docker is available.
 
 Other targets: `make test`, `make nextest`, `make test-cov`, `make clean`.
 
