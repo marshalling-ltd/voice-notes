@@ -456,6 +456,7 @@ mod tests {
             size_bytes: data.len() as u64,
             licence: "MIT".into(),
             licence_url: None,
+            served_as: "test-model".into(),
         }
     }
 

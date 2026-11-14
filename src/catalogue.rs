@@ -119,6 +119,9 @@ pub struct Model {
     pub licence: String,
     /// Where to read the licence.
     pub licence_url: Option<String>,
+    /// The model name the stack's server configurations (`stack/profiles`) serve this file
+    /// under. The client saves this name as its model once the server serves the file.
+    pub served_as: String,
 }
 
 impl Model {
@@ -225,7 +228,7 @@ pub struct Catalogue {
 
 const TIERS: [Tier; 4] = [Tier::Minimal, Tier::Light, Tier::Standard, Tier::Power];
 
-const MODEL_FIELDS: [&str; 9] = [
+const MODEL_FIELDS: [&str; 10] = [
     "id",
     "name",
     "role",
@@ -235,6 +238,7 @@ const MODEL_FIELDS: [&str; 9] = [
     "size_bytes",
     "licence",
     "licence_url",
+    "served_as",
 ];
 
 impl Catalogue {
@@ -343,6 +347,14 @@ fn text_field(table: &Table, key: &str, who: &str, problems: &mut Vec<String>) -
 fn valid_id(id: &str) -> bool {
     id.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The name a server serves a model under: letters, digits, `.`, `_` and `-`.
+fn valid_served_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn valid_sha256(text: &str) -> bool {
@@ -482,6 +494,14 @@ fn parse_model(
     let size_bytes = size_field(table, who, problems);
     let licence = text_field(table, "licence", who, problems);
     let licence_url = licence_url_field(table, who, problems);
+    let served_as = checked_field(
+        table,
+        "served_as",
+        who,
+        valid_served_name,
+        "letters, digits, `.`, `_` and `-`",
+        problems,
+    );
     if let Some(id) = &id
         && !ids.insert(id.clone())
     {
@@ -505,6 +525,7 @@ fn parse_model(
         size_bytes: size_bytes?,
         licence: licence?,
         licence_url,
+        served_as: served_as?,
     })
 }
 
@@ -612,6 +633,17 @@ fn parse_set(
             "{who}: `chat` and `reasoning` are the same model (\"{}\"); leave `reasoning` out",
             chat.id
         ));
+    }
+    // A server serves one model per name, so two jobs of one set cannot share a name.
+    let mut names = BTreeSet::new();
+    for (job, model) in &picked {
+        if !names.insert(model.served_as.as_str()) {
+            problems.push(format!(
+                "{who}: `{}` is served as \"{}\", which another job of the set already uses",
+                job.label(),
+                model.served_as
+            ));
+        }
     }
     let id_of = |job: Job| picked.get(&job).map(|m| m.id.clone());
     Some(Set {
@@ -724,7 +756,7 @@ mod tests {
     #[test]
     fn the_embedded_catalogue_is_valid() {
         let catalogue = Catalogue::parse(BUILTIN).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(catalogue.models().len(), 7);
+        assert_eq!(catalogue.models().len(), 8);
         assert_eq!(Catalogue::builtin(), &catalogue);
     }
 
@@ -751,7 +783,7 @@ mod tests {
         assert_eq!(ids(Tier::Standard), (turbo, "qwen3-14b", None, kokoro));
         assert_eq!(
             ids(Tier::Power),
-            (turbo, "qwen3-coder-30b-a3b", Some("qwen3-14b"), kokoro)
+            (turbo, "qwen3-coder-30b-a3b", Some("qwen3.8-27b"), kokoro)
         );
     }
 
@@ -769,6 +801,7 @@ mod tests {
                 "{who}: the licence must come with a link, it is shown before downloading"
             );
             assert!(!m.file_name().is_empty(), "{who}: file name");
+            assert!(valid_served_name(&m.served_as), "{who}: served_as");
             // A commit, not a branch: see stack/MODEL_HOSTING.md.
             let pinned = m
                 .url
@@ -1108,8 +1141,8 @@ mod tests {
             "`extreme` is not a size class",
         );
         rejects(
-            "reasoning = \"qwen3-14b\"",
-            "thinking = \"qwen3-14b\"",
+            "reasoning = \"qwen3.8-27b\"",
+            "thinking = \"qwen3.8-27b\"",
             "unknown job `thinking`",
         );
         rejects(
@@ -1122,7 +1155,7 @@ mod tests {
     #[test]
     fn the_reasoning_model_must_differ_from_the_chat_model() {
         rejects(
-            "reasoning = \"qwen3-14b\"",
+            "reasoning = \"qwen3.8-27b\"",
             "reasoning = \"qwen3-coder-30b-a3b\"",
             "`chat` and `reasoning` are the same model",
         );
@@ -1166,6 +1199,102 @@ mod tests {
     fn a_broken_model_is_not_reported_again_by_the_sets_that_use_it() {
         let message = error_of(&edited("size_bytes = 487601967", "size_bytes = 0"));
         assert_eq!(message.matches("whisper-small").count(), 1, "{message}");
+    }
+
+    // ---- served_as
+
+    #[test]
+    fn the_model_names_clients_save_are_the_ones_the_client_already_knows() {
+        let c = Catalogue::builtin();
+        let served = |id: &str| c.model(id).unwrap().served_as.as_str();
+        assert_eq!(
+            served("qwen3-coder-30b-a3b"),
+            "qwen3-coder-30b",
+            "the client's default fast model"
+        );
+        assert_eq!(
+            served("qwen3.8-27b"),
+            "qwen-reasoner",
+            "what the smart and think profiles ask for"
+        );
+        assert_eq!(
+            served("whisper-small"),
+            "whisper",
+            "the client's default speech-to-text model"
+        );
+        assert_eq!(served("whisper-large-v3-turbo-q5_0"), "whisper");
+        assert_eq!(served("kokoro-v1_0"), "kokoro");
+    }
+
+    /// The names promised here must be the names the stack's servers really use, or a model
+    /// downloaded through the app would never be found by the server.
+    #[test]
+    fn served_names_match_the_stacks_llama_swap_configs() {
+        let configs = [
+            include_str!("../stack/profiles/minimal.yaml"),
+            include_str!("../stack/profiles/light.yaml"),
+            include_str!("../stack/profiles/standard.yaml"),
+            include_str!("../stack/profiles/power.yaml"),
+        ];
+        let catalogue = Catalogue::builtin();
+        let mut checked = BTreeSet::new();
+        for yaml in configs {
+            let models = yaml.split("\ngroups:").next().unwrap();
+            let mut current = "";
+            for line in models.lines() {
+                if let Some(name) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':'))
+                    && !name.contains(' ')
+                    && !name.starts_with('#')
+                {
+                    current = name;
+                }
+                let Some(path) = line.trim().strip_prefix("-m /models/") else {
+                    continue;
+                };
+                let Some(model) = catalogue.models().iter().find(|m| m.file_name() == path) else {
+                    continue;
+                };
+                assert_eq!(
+                    model.served_as, current,
+                    "{} is served as `{current}` in the stack",
+                    model.id
+                );
+                checked.insert(model.id.clone());
+            }
+        }
+        assert!(
+            checked.len() >= 6,
+            "the cross-check compared too little: {checked:?}"
+        );
+    }
+
+    #[test]
+    fn served_as_is_required_and_must_be_a_plausible_name() {
+        let message = error_of(&without_field("served_as"));
+        assert!(
+            message.contains("model `whisper-small`: missing `served_as`"),
+            "{message}"
+        );
+        rejects(
+            "served_as = \"qwen3-4b\"",
+            "served_as = \"qwen 3\"",
+            "`served_as` must be letters, digits",
+        );
+        rejects(
+            "served_as = \"qwen3-4b\"",
+            "served_as = \"\"",
+            "`served_as` is empty",
+        );
+    }
+
+    /// A server serves one model per name, so two jobs of a set cannot have the same one.
+    #[test]
+    fn two_jobs_of_a_set_cannot_share_a_served_name() {
+        rejects(
+            "served_as = \"qwen-reasoner\"",
+            "served_as = \"qwen3-coder-30b\"",
+            "is served as \"qwen3-coder-30b\", which another job of the set already uses",
+        );
     }
 
     #[test]

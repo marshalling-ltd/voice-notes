@@ -21,9 +21,11 @@ use crate::chat::{Conversation, ReplyDelta};
 use crate::config::Config;
 use crate::devices::{self, DeviceInfo, Direction};
 use crate::download::{self, Phase as DownloadPhase};
-use crate::endpoints::Endpoints;
-use crate::hardware::{Tier, gib};
-use crate::modelscreen::{ActiveDownload, InstallState, ModelsAction, ModelsScreen, PendingModel};
+use crate::endpoints::{DEFAULT_STT_MODEL, Endpoints};
+use crate::hardware::{Hardware, Tier, gib};
+use crate::modelscreen::{
+    ActiveDownload, InstallState, ModelsAction, ModelsScreen, PendingModel, install_state,
+};
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
 use crate::setup::{self, Choice, Findings};
 use crate::speech::{SentenceSplitter, Speaker};
@@ -149,6 +151,9 @@ pub enum Action {
     },
     /// Look at this machine and open the models screen.
     OpenModels,
+    /// Download the catalogue models picked in the setup chooser, after showing their licences,
+    /// and use them once the server serves them.
+    DownloadChoices(Vec<setup::DownloadPick>),
     /// Download these models (catalogue ids), one after the other.
     StartDownloads(Vec<String>),
     /// Stop the running download and drop the ones waiting.
@@ -174,6 +179,8 @@ pub enum SetupState {
         config: Config,
         recommended: Config,
         models: Vec<String>,
+        /// The size class that fits this machine, if its memory could be found out.
+        tier: Option<Tier>,
     },
     /// Saved; shows the confirmation.
     Done(String),
@@ -518,14 +525,15 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        // The models screen is on top of the setup screen when setup opened it, so it comes first.
+        if self.models.is_some() {
+            return self.on_models_key(key);
+        }
         if self.setup.is_some() {
             return self.on_setup_key(key);
         }
         if self.devices.is_some() {
             return self.on_devices_key(key);
-        }
-        if self.models.is_some() {
-            return self.on_models_key(key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -581,8 +589,7 @@ impl App {
             return None;
         }
         if self.chooser.is_some() {
-            self.on_chooser_key(key);
-            return None;
+            return self.on_chooser_key(key);
         }
         match &self.setup {
             None => None,
@@ -620,12 +627,14 @@ impl App {
             config,
             recommended,
             models,
+            tier,
             ..
         }) = &self.setup
         else {
             return;
         };
-        let mut choices = setup::choices(models, recommended);
+        // The models the server serves, plus the catalogue's for this machine that it does not.
+        let mut choices = setup::choices_with_downloads(models, recommended, *tier);
         if choices.is_empty() {
             return;
         }
@@ -634,10 +643,8 @@ impl App {
     }
 
     /// Keys while the model chooser is open.
-    fn on_chooser_key(&mut self, key: KeyEvent) {
-        let Some(mut chooser) = self.chooser.take() else {
-            return;
-        };
+    fn on_chooser_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let mut chooser = self.chooser.take()?;
         let last = chooser.choices.len().saturating_sub(1);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => chooser.focus = chooser.focus.saturating_sub(1),
@@ -654,15 +661,20 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(SetupState::Ready { lines, config, .. }) = &mut self.setup {
+                    // Models the server serves are applied now; picks that still have to be
+                    // downloaded are not, they are saved once they are installed and served.
                     *config = setup::apply_choices(config, &chooser.choices);
                     refresh_save_block(lines, config);
                 }
-                return; // the chooser closes
+                let picks = setup::pending_downloads(&chooser.choices);
+                // The chooser closes; with downloads picked the licences are shown next.
+                return (!picks.is_empty()).then_some(Action::DownloadChoices(picks));
             }
-            KeyCode::Esc => return, // the chooser closes, nothing changes
+            KeyCode::Esc => return None, // the chooser closes, nothing changes
             _ => {}
         }
         self.chooser = Some(chooser);
+        None
     }
 
     /// Keys while the models screen is open.
@@ -765,16 +777,16 @@ fn clock(d: Duration) -> String {
 
 /// Render the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
+    if let Some(models) = &app.models {
+        draw_models(frame, models, app.notice.as_deref());
+        return;
+    }
     if let Some(setup) = &app.setup {
         draw_setup(frame, setup, app.chooser.as_ref());
         return;
     }
     if let Some(devices) = &app.devices {
         draw_devices(frame, devices, app.notice.as_deref());
-        return;
-    }
-    if let Some(models) = &app.models {
-        draw_models(frame, models, app.notice.as_deref());
         return;
     }
     let [header, meter, body, warnings, footer] = Layout::vertical([
@@ -1176,6 +1188,7 @@ fn draw_setup(frame: &mut Frame, setup: &SetupState, chooser: Option<&Chooser>) 
             lines,
             config,
             models,
+            tier,
             ..
         } => {
             let mut keys = if *config == Config::default() {
@@ -1187,7 +1200,7 @@ fn draw_setup(frame: &mut Frame, setup: &SetupState, chooser: Option<&Chooser>) 
             } else {
                 vec![("Enter", " save"), ("s", " skip"), ("q", " quit")]
             };
-            if !setup::choices(models, config).is_empty() {
+            if !setup::choices_with_downloads(models, config, *tier).is_empty() {
                 keys.insert(1, ("c", " change models"));
             }
             (lines.iter().map(|l| setup_line(l)).collect(), keys)
@@ -1250,6 +1263,7 @@ fn setup_state(found: &Findings) -> SetupState {
         recommended: plan.config.clone(),
         config: plan.config,
         models: found.models.clone().unwrap_or_default(),
+        tier: found.hardware.as_ref().and_then(Hardware::tier),
     }
 }
 
@@ -1439,6 +1453,15 @@ fn models_text(screen: &ModelsScreen, width: usize) -> Vec<Line<'static>> {
 /// The three rows at the bottom: what is downloading with its gauge, or how to start.
 fn draw_models_status(frame: &mut Frame, area: Rect, screen: &ModelsScreen) {
     let Some(active) = &screen.active else {
+        if let Some(message) = &screen.message {
+            frame.render_widget(
+                Paragraph::new(message.as_str())
+                    .style(Style::new().fg(Color::White))
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "Enter downloads the highlighted model; a downloads everything that is missing.",
@@ -1504,7 +1527,10 @@ fn draw_models(frame: &mut Frame, screen: &ModelsScreen, notice: Option<&str>) {
     let inner = block.inner(body);
     frame.render_widget(block, body);
     let width = usize::from(inner.width);
-    let [text, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(inner);
+    // The status rows below the list: three for a download, more for what happened after one.
+    let status_rows = if screen.message.is_some() { 5 } else { 3 };
+    let [text, status] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(status_rows)]).areas(inner);
     if let Some(pending) = &screen.pending {
         frame.render_widget(Paragraph::new(licence_lines(pending, width)), inner);
     } else {
@@ -1669,6 +1695,15 @@ fn draw_chooser(frame: &mut Frame, chooser: &Chooser) {
         )),
         Line::default(),
     ];
+    if chooser.choices.iter().any(|c| !c.downloadable.is_empty()) {
+        lines.insert(
+            2,
+            Line::from(Span::styled(
+                "↓ = not installed: Enter shows its licence, then downloads it.",
+                Style::new().fg(DIM),
+            )),
+        );
+    }
     for (i, choice) in chooser.choices.iter().enumerate() {
         let focused = i == chooser.focus;
         let marker = if focused { "▶ " } else { "  " };
@@ -1688,10 +1723,21 @@ fn draw_chooser(frame: &mut Frame, chooser: &Chooser) {
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
+    let downloads = chooser
+        .choices
+        .iter()
+        .any(|c| c.pending_download().is_some());
     let keys = [
         ("↑↓", " row"),
         ("←→", " change"),
-        ("Enter", " done"),
+        (
+            "Enter",
+            if downloads {
+                " licences, download"
+            } else {
+                " done"
+            },
+        ),
         ("Esc", " cancel"),
         ("q", " quit"),
     ];
@@ -1746,6 +1792,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(vec![hint_line(&first), hint_line(&second)]),
         area,
     );
+}
+
+/// "Qwen3 8B for chat and Whisper small for speech to text", for the messages after downloads.
+fn describe_picks(picks: &[setup::DownloadPick]) -> String {
+    let parts: Vec<String> = picks
+        .iter()
+        .map(|p| {
+            let job = match p.field {
+                setup::Field::Chat => "chat",
+                setup::Field::Smart => "smart chat",
+                setup::Field::SpeechToText => "speech to text",
+            };
+            format!("{} for {job}", p.candidate.name)
+        })
+        .collect();
+    parts.join(", ")
 }
 
 /// The warning for a failed recording. A microphone problem already says what to do about it
@@ -1814,6 +1876,11 @@ struct Session {
     download: Option<RunningDownload>,
     /// Models waiting for it to finish, by catalogue id.
     download_queue: std::collections::VecDeque<String>,
+    /// The choices from the setup screen the running downloads are for: once the models are in
+    /// place and the server serves them, they are saved and used.
+    after_download: Vec<setup::DownloadPick>,
+    /// How the config is saved (a field so that tests do not overwrite the real one).
+    save_config: fn(&Config) -> Result<std::path::PathBuf>,
     /// Looking around for models and services (setup screen).
     probe_task: Option<JoinHandle<Findings>>,
     /// Builds settings from a freshly saved config.
@@ -1852,6 +1919,8 @@ impl Session {
             models_dir,
             download: None,
             download_queue: std::collections::VecDeque::new(),
+            after_download: Vec::new(),
+            save_config: Config::save,
             probe_task: None,
             resolve,
         }
@@ -1952,6 +2021,7 @@ impl Session {
             Action::SwitchProfile(name) => self.switch_profile(app, &name),
             Action::OpenDevices => self.open_devices(app),
             Action::OpenModels => self.open_models(app),
+            Action::DownloadChoices(picks) => self.download_choices(app, picks).await,
             Action::StartDownloads(ids) => self.start_downloads(app, ids),
             Action::CancelDownload => self.cancel_download(),
             Action::SaveDevices { input, output } => self.save_devices(app, input, output),
@@ -1980,8 +2050,136 @@ impl Session {
             return;
         }
         app.notice = None;
+        // Downloads started from the setup screen's picks are used once they are in place.
+        self.after_download = app.models.as_mut().map_or_else(Vec::new, |screen| {
+            screen.message = None;
+            screen.picks.clone()
+        });
         self.download_queue = ids.into();
         self.start_next_download(app);
+    }
+
+    /// The setup screen picked catalogue models that are not installed: ask for their licences
+    /// first (on the models screen), and use them once they are downloaded and served.
+    async fn download_choices(&mut self, app: &mut App, picks: Vec<setup::DownloadPick>) {
+        let catalogue = Catalogue::builtin();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending = Vec::new();
+        for pick in &picks {
+            let Some(model) = catalogue.model(&pick.candidate.model_id) else {
+                continue;
+            };
+            if !seen.insert(model.id.clone()) {
+                continue; // picked for two jobs: downloaded once
+            }
+            let remaining_bytes = match install_state(model, &self.models_dir) {
+                InstallState::Installed => continue,
+                InstallState::Partial { have } => model.size_bytes - have,
+                InstallState::Missing => model.size_bytes,
+            };
+            pending.push(PendingModel {
+                model: model.clone(),
+                remaining_bytes,
+            });
+        }
+        if pending.is_empty() {
+            // Everything is on disk already; only the server has to be asked.
+            self.after_download = picks;
+            self.finish_picks(app).await;
+            return;
+        }
+        let hardware = crate::hardware::detect();
+        app.notice = None;
+        app.models = Some(ModelsScreen::for_picks(
+            hardware.summary(),
+            hardware.tier(),
+            self.models_dir.clone(),
+            pending,
+            picks,
+        ));
+    }
+
+    /// The downloads are done: look at what the server serves now, and save and use the picks it
+    /// has. For the others, say what to do, since the app does not manage the server.
+    async fn finish_picks(&mut self, app: &mut App) {
+        let picks = std::mem::take(&mut self.after_download);
+        if picks.is_empty() {
+            return;
+        }
+        let served = setup::list_models(&self.client, &self.endpoints.models)
+            .await
+            .unwrap_or_default();
+        let mut config = self.config.clone();
+        let (mut in_use, mut waiting) = (Vec::new(), Vec::new());
+        for pick in picks {
+            let found = match pick.field {
+                setup::Field::SpeechToText => served
+                    .iter()
+                    .find(|id| id.to_lowercase().contains("whisper"))
+                    .cloned(),
+                _ => served
+                    .contains(&pick.candidate.served_as)
+                    .then(|| pick.candidate.served_as.clone()),
+            };
+            match (found, pick.field) {
+                (Some(name), setup::Field::SpeechToText) => {
+                    config.stt_model = (name != DEFAULT_STT_MODEL).then_some(name);
+                    in_use.push(pick);
+                }
+                (Some(name), setup::Field::Chat) => {
+                    config.chat_model = Some(name);
+                    in_use.push(pick);
+                }
+                (Some(name), setup::Field::Smart) => {
+                    config.smart_model = Some(name);
+                    in_use.push(pick);
+                }
+                (None, _) => waiting.push(pick),
+            }
+        }
+        let mut message = Vec::new();
+        if !in_use.is_empty() {
+            match (self.save_config)(&config) {
+                Ok(_) => {
+                    self.config = config;
+                    let profile = app.profile.clone();
+                    match (self.resolve)(&self.config, Some(&profile)) {
+                        Ok(settings) => self.apply(app, &settings),
+                        Err(e) => app.notice = Some(format!("{e:#}")),
+                    }
+                    message.push(format!("Now using {}.", describe_picks(&in_use)));
+                }
+                Err(e) => app.notice = Some(format!("not saved: {e:#}")),
+            }
+        }
+        if !waiting.is_empty() {
+            message.push(Self::not_served_message(&waiting));
+            app.notice =
+                Some("Downloaded, but the server does not serve it yet (see below)".into());
+        }
+        if let Some(screen) = app.models.as_mut() {
+            screen.message = Some(message.join(" "));
+        }
+    }
+
+    /// What to do when a downloaded model is not served: the app does not manage the server.
+    fn not_served_message(waiting: &[setup::DownloadPick]) -> String {
+        let class = waiting
+            .iter()
+            .filter_map(|p| Catalogue::builtin().model(&p.candidate.model_id))
+            .map(|m| m.class)
+            .max()
+            .unwrap_or(Tier::Minimal)
+            .label();
+        let names: Vec<String> = waiting
+            .iter()
+            .map(|p| format!("`{}`", p.candidate.served_as))
+            .collect();
+        format!(
+            "Downloaded {}, but your server does not serve {} yet. Start the stack (stack/macos.sh start {class}) or add the file to its llama-swap configuration, then pick it again.",
+            describe_picks(waiting),
+            names.join(", "),
+        )
     }
 
     /// Start downloading the next queued model in the background.
@@ -2050,12 +2248,12 @@ impl Session {
             && let Some(done) = self.download.take()
         {
             let result = done.task.await;
-            self.finish_download(app, &done.id, result);
+            self.finish_download(app, &done.id, result).await;
         }
     }
 
     /// A download ended: show what is on disk now, and go on to the next one if all went well.
-    fn finish_download(
+    async fn finish_download(
         &mut self,
         app: &mut App,
         id: &str,
@@ -2069,10 +2267,20 @@ impl Session {
             .model(id)
             .map_or_else(|| id.to_string(), |m| m.name.clone());
         match result {
-            Ok(Ok(_)) => self.start_next_download(app),
-            Ok(Err(download::DownloadError::Cancelled)) => self.download_queue.clear(),
+            Ok(Ok(_)) => {
+                self.start_next_download(app);
+                if self.download.is_none() {
+                    // That was the last one: use the picks the server has.
+                    self.finish_picks(app).await;
+                }
+            }
+            Ok(Err(download::DownloadError::Cancelled)) => {
+                self.download_queue.clear();
+                self.after_download.clear();
+            }
             Ok(Err(e)) => {
                 self.download_queue.clear();
+                self.after_download.clear();
                 let hint = if e.keeps_progress() {
                     " Enter continues."
                 } else {
@@ -2082,6 +2290,7 @@ impl Session {
             }
             Err(e) => {
                 self.download_queue.clear();
+                self.after_download.clear();
                 app.notice = Some(format!("{name}: the download stopped unexpectedly ({e})"));
             }
         }
@@ -3089,7 +3298,7 @@ mod setup_tests {
         };
         assert_eq!(config, Config::default());
         let text = lines.join("\n");
-        assert!(text.contains("managed install") && !text.contains("Will save"));
+        assert!(text.contains("Models you can download") && !text.contains("Will save"));
     }
 
     /// The setup screen replaces the main screen and shows the right keys for each state.
@@ -3107,7 +3316,7 @@ mod setup_tests {
         }
 
         let text = screen(&ready(&Findings::default()));
-        assert!(text.contains("preview, not available yet") && text.contains("Qwen3-8B"));
+        assert!(text.contains("Models you can download") && text.contains("Qwen3 8B"));
         assert!(text.contains("don't ask again"));
 
         app.setup = Some(SetupState::Done("Saved to /x/config.toml.".into()));
@@ -3534,11 +3743,33 @@ mod chooser_tests {
     /// With no models to choose between (the server did not answer), `c` does nothing and the
     /// setup screen does not offer it.
     #[test]
-    fn nothing_to_choose_without_models() {
+    fn with_no_models_the_chooser_offers_the_catalogue_to_download() {
+        // A fresh machine: no server answered, so nothing is served. The chooser still opens,
+        // with the models of this machine's class to download.
         let mut app = app_with(&Findings::default());
-        assert!(!screen(&app).contains("change models"));
+        assert!(screen(&app).contains("change models"));
         app.on_key(press(KeyCode::Char('c')));
-        assert!(app.chooser.is_none());
+        let chooser = app
+            .chooser
+            .as_ref()
+            .expect("the chooser opens on a fresh machine");
+        let jobs: Vec<setup::Field> = chooser.choices.iter().map(|c| c.field).collect();
+        assert_eq!(
+            jobs,
+            [
+                setup::Field::Chat,
+                setup::Field::Smart,
+                setup::Field::SpeechToText
+            ]
+        );
+        assert!(
+            chooser
+                .choices
+                .iter()
+                .all(|c| c.pending_download().is_some()),
+            "each starts on a download"
+        );
+        // Still nothing to choose while the machine is being looked at.
         let mut probing = App::new(false);
         probing.setup = Some(SetupState::Probing);
         probing.on_key(press(KeyCode::Char('c')));
@@ -3702,6 +3933,327 @@ mod session_tests {
             .progress;
         assert_eq!(shown, Some(report(40)), "the latest report wins");
         session.download.take().unwrap().task.abort();
+    }
+
+    // ---- using downloaded models once the server serves them
+
+    thread_local! {
+        static SAVED: std::cell::RefCell<Vec<Config>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Stands in for saving the config, so a test never overwrites the real one. (The signature
+    // is fixed by `Session::save_config`.)
+    #[allow(clippy::unnecessary_wraps)]
+    fn record_save(config: &Config) -> Result<std::path::PathBuf> {
+        SAVED.with(|saved| saved.borrow_mut().push(config.clone()));
+        Ok("/nonexistent/config.toml".into())
+    }
+
+    fn failing_save(_: &Config) -> Result<std::path::PathBuf> {
+        anyhow::bail!("disk full")
+    }
+
+    fn saved() -> Vec<Config> {
+        SAVED.with(|saved| saved.borrow().clone())
+    }
+
+    fn pick(field: setup::Field, id: &str) -> setup::DownloadPick {
+        let model = Catalogue::builtin().model(id).unwrap();
+        setup::DownloadPick {
+            field,
+            candidate: setup::Candidate {
+                model_id: model.id.clone(),
+                name: model.name.clone(),
+                served_as: model.served_as.clone(),
+                size_bytes: model.size_bytes,
+            },
+        }
+    }
+
+    /// A session whose server lists `served`, whose resolver works, and whose saving is recorded.
+    async fn serving(served: &[&str]) -> (Session, App) {
+        SAVED.with(|saved| saved.borrow_mut().clear());
+        let data: Vec<String> = served
+            .iter()
+            .map(|id| format!(r#"{{"id":"{id}"}}"#))
+            .collect();
+        let (base, _request) = crate::test_support::capture_once(
+            "application/json",
+            format!(r#"{{"data":[{}]}}"#, data.join(",")),
+        )
+        .await;
+        let launch = settings("http://127.0.0.1:1/stt", "w", "c");
+        let resolver: Resolver = Arc::new(move |_, _| Ok(launch.clone()));
+        let mut session = Session::new(&launch_settings(), resolver, Config::default());
+        session.endpoints.models = format!("{base}/v1/models");
+        session.save_config = record_save;
+        let mut app = App::new(false);
+        app.models = Some(ModelsScreen::new(
+            "test machine".into(),
+            Some(Tier::Light),
+            "/nonexistent".into(),
+        ));
+        (session, app)
+    }
+
+    fn launch_settings() -> Settings {
+        settings("http://127.0.0.1:1/stt", "w", "c")
+    }
+
+    fn message(app: &App) -> String {
+        app.models
+            .as_ref()
+            .and_then(|s| s.message.clone())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn models_the_server_serves_are_saved_and_used_straight_away() {
+        let (mut session, mut app) = serving(&["qwen3-8b", "whisper"]).await;
+        session.after_download = vec![
+            pick(setup::Field::Chat, "qwen3-8b"),
+            pick(setup::Field::SpeechToText, "whisper-large-v3-turbo-q5_0"),
+        ];
+        session.finish_picks(&mut app).await;
+        let written = saved();
+        assert_eq!(written.len(), 1, "saved once");
+        assert_eq!(written[0].chat_model.as_deref(), Some("qwen3-8b"));
+        assert_eq!(
+            written[0].stt_model, None,
+            "whisper is the default name and is not written"
+        );
+        assert_eq!(
+            session.config.chat_model.as_deref(),
+            Some("qwen3-8b"),
+            "and in use now"
+        );
+        assert!(session.after_download.is_empty(), "no pick is left waiting");
+        assert_eq!(app.notice, None);
+        assert_eq!(
+            message(&app),
+            "Now using Qwen3 8B (Q4_K_M) for chat, Whisper large-v3-turbo (q5_0) for speech to text."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_the_server_does_not_serve_is_not_saved_and_the_message_says_what_to_do() {
+        let (mut session, mut app) = serving(&["whisper"]).await;
+        session.after_download = vec![pick(setup::Field::Chat, "qwen3-8b")];
+        session.finish_picks(&mut app).await;
+        assert!(
+            saved().is_empty(),
+            "nothing is saved that the server cannot answer to"
+        );
+        assert_eq!(session.config.chat_model, None);
+        let notice = app.notice.clone().unwrap();
+        assert!(notice.contains("does not serve it yet"), "{notice}");
+        let text = message(&app);
+        for expected in [
+            "Qwen3 8B (Q4_K_M)",
+            "`qwen3-8b`",
+            "stack/macos.sh start light",
+            "llama-swap",
+        ] {
+            assert!(text.contains(expected), "{expected:?} missing in: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn what_the_server_has_is_used_and_the_rest_is_explained() {
+        let (mut session, mut app) = serving(&["qwen3-8b"]).await;
+        session.after_download = vec![
+            pick(setup::Field::Chat, "qwen3-8b"),
+            pick(setup::Field::Smart, "qwen3.8-27b"),
+        ];
+        session.finish_picks(&mut app).await;
+        let written = saved();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].chat_model.as_deref(), Some("qwen3-8b"));
+        assert_eq!(
+            written[0].smart_model, None,
+            "the reasoner is not served yet"
+        );
+        let text = message(&app);
+        assert!(
+            text.contains("Now using Qwen3 8B (Q4_K_M) for chat."),
+            "{text}"
+        );
+        assert!(
+            text.contains("does not serve `qwen-reasoner` yet"),
+            "{text}"
+        );
+        assert!(
+            text.contains("stack/macos.sh start power"),
+            "the class of the model that is waiting: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_serves_another_whisper_name_is_remembered_by_that_name() {
+        let (mut session, mut app) = serving(&["whisper-large-v3"]).await;
+        session.after_download = vec![pick(setup::Field::SpeechToText, "whisper-small")];
+        session.finish_picks(&mut app).await;
+        assert_eq!(saved()[0].stt_model.as_deref(), Some("whisper-large-v3"));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_answer_counts_as_serving_nothing() {
+        let (mut session, mut app) = serving(&["qwen3-8b"]).await;
+        session.endpoints.models = "http://127.0.0.1:1/v1/models".into();
+        session.after_download = vec![pick(setup::Field::Chat, "qwen3-8b")];
+        session.finish_picks(&mut app).await;
+        assert!(saved().is_empty(), "nothing was saved");
+        assert!(app.notice.unwrap().contains("does not serve it yet"));
+    }
+
+    #[tokio::test]
+    async fn a_config_that_cannot_be_saved_is_reported_and_not_used() {
+        let (mut session, mut app) = serving(&["qwen3-8b"]).await;
+        session.save_config = failing_save;
+        session.after_download = vec![pick(setup::Field::Chat, "qwen3-8b")];
+        session.finish_picks(&mut app).await;
+        assert_eq!(app.notice.as_deref(), Some("not saved: disk full"));
+        assert_eq!(
+            session.config.chat_model, None,
+            "an unsaved choice is not used either"
+        );
+        assert!(!message(&app).contains("Now using"));
+    }
+
+    #[tokio::test]
+    async fn without_picks_nothing_happens() {
+        let (mut session, mut app) = serving(&["qwen3-8b"]).await;
+        session.finish_picks(&mut app).await;
+        assert!(saved().is_empty(), "nothing was saved");
+        assert_eq!((app.notice.clone(), message(&app)), (None, String::new()));
+    }
+
+    // ---- from the setup screen's picks to the licence question
+
+    fn folder(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("voice-notes-picks-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn put(dir: &std::path::Path, name: &str, bytes: u64) {
+        std::fs::File::create(dir.join(name))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn picked_models_that_are_missing_open_the_licence_question() {
+        let (mut session, mut app) = serving(&[]).await;
+        let dir = folder("question");
+        session.models_dir = dir.clone();
+        app.models = None;
+        let chat = Catalogue::builtin().model("qwen3-8b").unwrap();
+        put(&dir, &format!("{}.part", chat.file_name()), 1000);
+        let picks = vec![
+            pick(setup::Field::Chat, "qwen3-8b"),
+            pick(setup::Field::Smart, "qwen3-8b"), // the same model for two jobs
+            pick(setup::Field::SpeechToText, "whisper-large-v3-turbo-q5_0"),
+        ];
+        session.download_choices(&mut app, picks.clone()).await;
+        let screen = app.models.as_ref().expect("the models screen opens");
+        assert!(
+            screen.confirming(),
+            "the licences come before anything is downloaded"
+        );
+        let pending = screen.pending.as_ref().unwrap();
+        let ids: Vec<&str> = pending.iter().map(|p| p.model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["qwen3-8b", "whisper-large-v3-turbo-q5_0"],
+            "once each"
+        );
+        assert_eq!(
+            pending[0].remaining_bytes,
+            chat.size_bytes - 1000,
+            "a partial download counts what is left"
+        );
+        assert_eq!(screen.picks, picks);
+        assert!(
+            session.download.is_none(),
+            "nothing runs until the licences are accepted"
+        );
+        assert!(
+            session.after_download.is_empty(),
+            "the picks wait on the screen until then"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn picks_that_are_already_on_disk_go_straight_to_asking_the_server() {
+        let (mut session, mut app) = serving(&["qwen3-8b"]).await;
+        let dir = folder("installed");
+        session.models_dir = dir.clone();
+        app.models = None;
+        let chat = Catalogue::builtin().model("qwen3-8b").unwrap();
+        put(&dir, chat.file_name(), chat.size_bytes);
+        session
+            .download_choices(&mut app, vec![pick(setup::Field::Chat, "qwen3-8b")])
+            .await;
+        assert!(
+            app.models.is_none(),
+            "there is nothing to download, so no licence question"
+        );
+        assert_eq!(saved()[0].chat_model.as_deref(), Some("qwen3-8b"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn accepting_hands_the_picks_to_the_download() {
+        let (mut session, mut app) = serving(&[]).await;
+        let picks = vec![pick(setup::Field::Chat, "qwen3-8b")];
+        let screen = app.models.as_mut().unwrap();
+        screen.picks = picks.clone();
+        screen.message = Some("an old message".into());
+        // An unknown id stops before any download starts, so no network is used.
+        session.start_downloads(&mut app, vec!["no-such-model".into()]);
+        assert_eq!(session.after_download, picks);
+        assert_eq!(
+            app.models.as_ref().unwrap().message,
+            None,
+            "the old message is cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_finished_download_uses_the_picks() {
+        let (mut session, mut app) = serving(&["qwen3-8b"]).await;
+        session.after_download = vec![pick(setup::Field::Chat, "qwen3-8b")];
+        session.download = Some(running("qwen3-8b", Ok(fetched())).0);
+        finished(&mut session, &mut app).await;
+        assert_eq!(saved()[0].chat_model.as_deref(), Some("qwen3-8b"));
+        assert!(
+            message(&app).contains("Now using Qwen3 8B"),
+            "{}",
+            message(&app)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_cancelled_download_forgets_the_picks() {
+        for error in [
+            download::DownloadError::Cancelled,
+            download::DownloadError::Network("reset".into()),
+        ] {
+            let (mut session, mut app) = serving(&["qwen3-8b"]).await;
+            session.after_download = vec![pick(setup::Field::Chat, "qwen3-8b")];
+            session.download = Some(running("qwen3-8b", Err(error)).0);
+            finished(&mut session, &mut app).await;
+            assert!(session.after_download.is_empty(), "no pick is left waiting");
+            assert!(
+                saved().is_empty(),
+                "nothing is used when the download did not finish"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4444,7 +4996,7 @@ mod models_tests {
         for name in [
             "Whisper large-v3-turbo",
             "Qwen3-Coder 30B-A3B",
-            "Qwen3 14B",
+            "Qwen3.8 27B",
             "Kokoro",
         ] {
             assert!(text.contains(name), "{name} missing in:\n{text}");
@@ -4816,5 +5368,277 @@ mod models_tests {
             100,
             "no overflow for huge files"
         );
+    }
+}
+
+/// Picking catalogue models to download from the setup chooser, and what follows.
+#[cfg(test)]
+mod setup_download_tests {
+    use super::*;
+    use crate::modelscreen::PendingModel;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The setup screen of a machine of class `tier` with `models` served.
+    fn setup_app(tier: Option<Tier>, models: &[&str]) -> App {
+        let mut app = App::new(false);
+        app.setup = Some(SetupState::Ready {
+            lines: vec!["What I found".into()],
+            config: Config::default(),
+            recommended: Config::default(),
+            models: models.iter().map(ToString::to_string).collect(),
+            tier,
+        });
+        app
+    }
+
+    fn render(app: &App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn pending_for(id: &str) -> PendingModel {
+        let model = Catalogue::builtin().model(id).unwrap().clone();
+        PendingModel {
+            remaining_bytes: model.size_bytes,
+            model,
+        }
+    }
+
+    #[test]
+    fn the_setup_state_knows_the_class_that_fits_the_machine() {
+        let found = Findings {
+            hardware: Some(crate::hardware::Hardware {
+                os: "linux",
+                arch: "x86_64",
+                cores: 8,
+                ram_bytes: Some(32 << 30),
+                gpu: crate::hardware::Gpu::Dedicated {
+                    name: "Test".into(),
+                    vram_bytes: 12 << 30,
+                },
+                disk_free_bytes: None,
+            }),
+            ..Findings::default()
+        };
+        let SetupState::Ready { tier, .. } = setup_state(&found) else {
+            panic!("expected the ready state");
+        };
+        assert_eq!(tier, Some(Tier::Light), "12 GB of VRAM");
+        let SetupState::Ready { tier, .. } = setup_state(&Findings::default()) else {
+            panic!("expected the ready state");
+        };
+        assert_eq!(tier, None, "unknown hardware");
+    }
+
+    // ---- choosing
+
+    #[test]
+    fn on_a_fresh_machine_enter_hands_every_pick_over_for_downloading() {
+        let mut app = setup_app(Some(Tier::Light), &[]);
+        app.on_key(press(KeyCode::Char('c')));
+        let action = app.on_key(press(KeyCode::Enter));
+        let Some(Action::DownloadChoices(picks)) = action else {
+            panic!("expected the picks to be handed over, got {action:?}");
+        };
+        let found: Vec<(setup::Field, &str)> = picks
+            .iter()
+            .map(|p| (p.field, p.candidate.model_id.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (setup::Field::Chat, "qwen3-8b"),
+                (setup::Field::Smart, "qwen3-8b"),
+                (setup::Field::SpeechToText, "whisper-large-v3-turbo-q5_0"),
+            ]
+        );
+        assert!(app.chooser.is_none(), "the chooser closes");
+        let Some(SetupState::Ready { config, .. }) = &app.setup else {
+            panic!("setup stays open behind");
+        };
+        assert_eq!(
+            *config,
+            Config::default(),
+            "nothing is written to the config before the download"
+        );
+    }
+
+    #[test]
+    fn choosing_only_served_models_does_not_ask_for_a_download() {
+        let mut app = setup_app(Some(Tier::Light), &["qwen3-coder-30b", "whisper"]);
+        app.on_key(press(KeyCode::Char('c')));
+        app.on_key(press(KeyCode::Right)); // the one served chat model
+        assert_eq!(app.on_key(press(KeyCode::Enter)), None);
+        let Some(SetupState::Ready { config, .. }) = &app.setup else {
+            panic!("setup stays open");
+        };
+        assert_eq!(
+            config.chat_model.as_deref(),
+            Some("qwen3-coder-30b"),
+            "applied as before"
+        );
+    }
+
+    #[test]
+    fn a_download_can_be_picked_among_served_models_and_only_it_is_handed_over() {
+        let mut app = setup_app(Some(Tier::Light), &["qwen3-coder-30b", "whisper"]);
+        app.on_key(press(KeyCode::Char('c')));
+        app.on_key(press(KeyCode::Right));
+        app.on_key(press(KeyCode::Right)); // past the served model: the first download
+        let Some(Action::DownloadChoices(picks)) = app.on_key(press(KeyCode::Enter)) else {
+            panic!("expected a download");
+        };
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].candidate.model_id, "qwen3-8b");
+    }
+
+    #[test]
+    fn escape_in_the_chooser_hands_nothing_over() {
+        let mut app = setup_app(Some(Tier::Light), &[]);
+        app.on_key(press(KeyCode::Char('c')));
+        assert_eq!(app.on_key(press(KeyCode::Esc)), None);
+        assert!(app.chooser.is_none());
+    }
+
+    #[test]
+    fn the_chooser_marks_downloads_and_says_what_enter_does() {
+        let mut app = setup_app(Some(Tier::Minimal), &[]);
+        app.on_key(press(KeyCode::Char('c')));
+        let rows = render(&app);
+        let text = rows.join("\n");
+        for expected in [
+            "↓ = not installed: Enter shows its licence",
+            "‹ ↓ Qwen3 4B (Q4_K_M) · 2.5 GB to download ›",
+            "‹ ↓ Whisper small · 488 MB to download ›",
+        ] {
+            assert!(text.contains(expected), "{expected:?} missing in:\n{text}");
+        }
+        assert!(
+            rows[23].contains("Enter licences, download"),
+            "{:?}",
+            rows[23]
+        );
+        assert!(rows.iter().all(|r| r.chars().count() <= 80));
+    }
+
+    #[test]
+    fn with_only_served_models_the_chooser_looks_as_before() {
+        let mut app = setup_app(Some(Tier::Light), &["qwen3-coder-30b", "whisper"]);
+        app.on_key(press(KeyCode::Char('c')));
+        let rows = render(&app);
+        assert!(rows[23].contains("Enter done"), "{:?}", rows[23]);
+        assert!(
+            !rows.join("\n").contains("to download ›"),
+            "nothing is picked to download"
+        );
+    }
+
+    // ---- the licence question on top of setup
+
+    #[test]
+    fn the_models_screen_is_on_top_of_setup_and_escape_goes_back_to_it() {
+        let mut app = setup_app(Some(Tier::Light), &[]);
+        app.models = Some(ModelsScreen::for_picks(
+            "test machine".into(),
+            Some(Tier::Light),
+            "/nonexistent".into(),
+            vec![pending_for("qwen3-8b")],
+            Vec::new(),
+        ));
+        let text = render(&app).join("\n");
+        assert!(
+            text.contains("Models · Licences") && text.contains("Qwen3 8B"),
+            "{text}"
+        );
+        assert_eq!(
+            app.on_key(press(KeyCode::Esc)),
+            None,
+            "declines the question"
+        );
+        assert!(app.models.as_ref().is_some_and(|s| !s.confirming()));
+        assert_eq!(
+            app.on_key(press(KeyCode::Esc)),
+            None,
+            "closes the models screen"
+        );
+        assert!(app.models.is_none());
+        assert!(app.setup.is_some(), "and the setup screen is still there");
+        assert!(render(&app).join("\n").contains("What I found"));
+    }
+
+    #[test]
+    fn accepting_the_question_starts_the_downloads() {
+        let mut app = setup_app(Some(Tier::Light), &[]);
+        app.models = Some(ModelsScreen::for_picks(
+            "test machine".into(),
+            Some(Tier::Light),
+            "/nonexistent".into(),
+            vec![pending_for("qwen3-8b"), pending_for("kokoro-v1_0")],
+            Vec::new(),
+        ));
+        assert_eq!(
+            app.on_key(press(KeyCode::Enter)),
+            Some(Action::StartDownloads(vec![
+                "qwen3-8b".into(),
+                "kokoro-v1_0".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn the_message_after_a_download_is_shown_on_the_models_screen() {
+        let mut screen = ModelsScreen::new(
+            "test machine".into(),
+            Some(Tier::Light),
+            "/nonexistent".into(),
+        );
+        screen.message = Some("Now using Qwen3 8B (Q4_K_M) for chat.".into());
+        let mut app = App::new(false);
+        app.models = Some(screen);
+        let rows = render(&app);
+        assert!(
+            rows.join("\n")
+                .contains("Now using Qwen3 8B (Q4_K_M) for chat.")
+        );
+        assert!(
+            !rows
+                .join("\n")
+                .contains("Enter downloads the highlighted model"),
+            "the message replaces the hint"
+        );
+        assert!(rows.iter().all(|r| r.chars().count() <= 80));
+    }
+
+    #[test]
+    fn a_long_message_wraps_within_the_screen() {
+        let mut screen = ModelsScreen::new(
+            "test machine".into(),
+            Some(Tier::Power),
+            "/nonexistent".into(),
+        );
+        screen.message = Some("Downloaded Qwen3.8 27B (UD-Q4_K_M) for smart chat, but your server does not serve `qwen-reasoner` yet. Start the stack (stack/macos.sh start power) or add the file to its llama-swap configuration, then pick it again.".into());
+        let mut app = App::new(false);
+        app.models = Some(screen);
+        let rows = render(&app);
+        let text = rows.join("\n");
+        for part in [
+            "Downloaded Qwen3.8 27B",
+            "stack/macos.sh start power",
+            "pick it again.",
+        ] {
+            assert!(text.contains(part), "{part} was cut off in:\n{text}");
+        }
     }
 }

@@ -30,7 +30,7 @@ models:
     cmd: >
       llama-server
       --host 127.0.0.1 --port ${PORT}
-      -m /models/Qwen3-14B-Q4_K_M.gguf
+      -m /models/Qwen3.8-27B-UD-Q4_K_M.gguf
       --jinja -c 8192
 
 # Speech to text stays loaded. The chat models are too big to hold together, so they take turns:

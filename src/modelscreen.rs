@@ -6,6 +6,7 @@
 use crate::catalogue::{Catalogue, Job, Model};
 use crate::download::Progress;
 use crate::hardware::Tier;
+use crate::setup::DownloadPick;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,13 @@ pub struct ModelsScreen {
     /// The models the user asked to download. While this is set the screen shows their licences,
     /// and nothing is downloaded until the user accepts.
     pub pending: Option<Vec<PendingModel>>,
+    /// The choices from the setup screen that these downloads are for. Once they are installed
+    /// and the server serves them, they are saved and used. Empty when the screen was opened by
+    /// itself.
+    pub picks: Vec<DownloadPick>,
+    /// What happened after the downloads: what is now in use, or what is still to be done. Shown
+    /// at the bottom of the screen.
+    pub message: Option<String>,
     dir: PathBuf,
 }
 
@@ -105,9 +113,27 @@ impl ModelsScreen {
             focus: 0,
             active: None,
             pending: None,
+            picks: Vec::new(),
+            message: None,
             dir,
         };
         screen.refresh();
+        screen
+    }
+
+    /// The screen opened by the setup screen for models the user picked there: it starts on the
+    /// licence question for `pending`, and remembers `picks` to use them once they are in place.
+    #[must_use]
+    pub fn for_picks(
+        hardware: String,
+        detected: Option<Tier>,
+        dir: PathBuf,
+        pending: Vec<PendingModel>,
+        picks: Vec<DownloadPick>,
+    ) -> Self {
+        let mut screen = Self::new(hardware, detected, dir);
+        screen.pending = Some(pending);
+        screen.picks = picks;
         screen
     }
 

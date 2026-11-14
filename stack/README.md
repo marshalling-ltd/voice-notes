@@ -22,7 +22,7 @@ The profiles are the four size classes the client's hardware check (`voice-notes
 | `minimal` | under 8 GB | Whisper small (488 MB) | `qwen3-4b` (Qwen3-4B Q4_K_M, 2.5 GB) | 3.0 GB | about 3.5 GB |
 | `light` | 8 to 16 GB | Whisper small | `qwen3-8b` (Qwen3-8B Q4_K_M, 5.0 GB) | 5.5 GB | about 6.5 GB |
 | `standard` | 16 to 24 GB | Whisper small | `qwen3-14b` (Qwen3-14B Q4_K_M, 9.0 GB) | 9.5 GB | about 11 GB |
-| `power` | 24 GB or more | Whisper large-v3-turbo q5_0 (574 MB) | `qwen3-coder-30b` (Qwen3-Coder-30B-A3B UD-Q4_K_XL, 17.7 GB) and `qwen-reasoner` (Qwen3-14B Q4_K_M, 9.0 GB) | 27.2 GB | about 19 GB |
+| `power` | 24 GB or more | Whisper large-v3-turbo q5_0 (574 MB) | `qwen3-coder-30b` (Qwen3-Coder-30B-A3B UD-Q4_K_XL, 17.7 GB) and `qwen-reasoner` (Qwen3.8-27B UD-Q4_K_M, 16.6 GB) | 34.8 GB | about 19 GB |
 | `ci` | any | Whisper tiny.en q5_1 (32 MB) | `qwen3-0.6b` (Qwen3-0.6B Q4_K_M, 397 MB) | 430 MB | about 0.6 GB |
 
 - **Download** is the size of the model files. **Loaded at once** is an estimate: the files in use plus room for the conversation (the context size is 4096 tokens for `minimal` and 8192 for the others). It was not measured, except that the `minimal` and `ci` profiles were started and used.
