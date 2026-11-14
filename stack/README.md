@@ -54,6 +54,33 @@ voice-notes turn --input-wav question.wav --no-audio-output --chat-model qwen3-8
 
 With `power` the client's defaults already match (`qwen3-coder-30b` and `qwen-reasoner`). `voice-notes setup` lists the models the stack offers and picks from them.
 
+## macOS, without containers
+
+On a Mac, run the same services natively with `stack/macos.sh`. Docker Desktop cannot give a container the Apple GPU, and a native process can use it (Metal).
+
+```sh
+stack/macos.sh install            # once: installs and builds everything, takes a while
+stack/macos.sh start light        # downloads the models of the profile, starts the services
+stack/macos.sh status
+stack/macos.sh stop
+```
+
+It is the same stack: llama-swap on `127.0.0.1:8080`, Kokoro on `127.0.0.1:8880`, the same profiles (`minimal`, `light`, `standard`, `power`, `ci`) with the same models, downloaded and checked by the same `fetch_models.py`. The llama-swap configuration is the file from `profiles/` with the models folder rewritten, so the model names are the same too. The client needs no change: `voice-notes --chat-model qwen3-8b` works against it exactly as against the containers.
+
+What `install` sets up, in `~/.local/share/voice-notes-stack` (override with `VOICE_NOTES_STACK_HOME`; no spaces in the path):
+
+| Piece | Where it comes from | Pinned? |
+| --- | --- | --- |
+| llama.cpp (`llama-server`) | Homebrew | No: Homebrew has no way to pin a version, so it is whatever is current |
+| whisper.cpp (`whisper-server`) | built from source at tag `v1.9.5` | Yes, by commit. Homebrew's whisper.cpp is built without the server, so it cannot be used |
+| llama-swap | release tarball `v272` | Yes, version and sha256 |
+| Kokoro | cloned at tag `v0.10.0` and run with `uv` | Yes, by commit. Its Python packages are not locked by us |
+| ffmpeg, espeak-ng, cmake, uv | Homebrew | No |
+
+Also: everything listens on `127.0.0.1` and there is deliberately no setting to change that (Kokoro's own script listens on all interfaces; `macos.sh` overrides it). `KOKORO_DEVICE=cpu` makes Kokoro avoid the Apple GPU. Logs: `stack/macos.sh logs [llama-swap|kokoro]`.
+
+**Status: written on Linux and not yet run on a Mac.** The parts that do not depend on macOS were run for real here: model download, configuration rewrite, start, health wait, a full voice turn through the native llama-swap, status, stop, and the loopback binding. Not run: `install` (Homebrew, the whisper.cpp build, Kokoro with `uv` and PyTorch), Metal and MPS. The `macOS native stack` workflow (`.github/workflows/macos.yml`, started by hand) runs all of it on a macOS runner, but that is a virtual machine without the GPU, so only a run on real hardware shows that Metal is used.
+
 ## Settings
 
 Set these in the environment or in a `stack/.env` file.
@@ -148,6 +175,6 @@ CI runs it two ways:
 ## Checks
 
 ```sh
-python3 -m unittest discover -s stack     # the model downloader, the image pinning, and that the llama-swap configs match their catalogues
+python3 -m unittest discover -s stack     # the model downloader, the image pinning, the macOS script, and that the llama-swap configs match their catalogues
 python3 stack/pin_images.py --check       # every image is pinned by digest
 ```
