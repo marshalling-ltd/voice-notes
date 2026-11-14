@@ -13,6 +13,7 @@ pub mod endpoints;
 pub mod hardware;
 pub mod headless;
 pub mod latency;
+pub mod modelscreen;
 pub mod pipeline;
 pub mod playback;
 pub mod profile;

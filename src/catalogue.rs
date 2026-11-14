@@ -172,6 +172,8 @@ impl<'a> ChosenSet<'a> {
     /// The distinct models in the set (the reasoning model can also be another class's chat
     /// model, but within one set nothing appears twice).
     #[must_use]
+    // Part of the library's API; the binary compiles this module separately and does not call it.
+    #[allow(dead_code)]
     pub fn models(&self) -> Vec<&'a Model> {
         let mut seen = BTreeSet::new();
         self.jobs()
@@ -183,6 +185,8 @@ impl<'a> ChosenSet<'a> {
 
     /// How many bytes the set takes to download.
     #[must_use]
+    // Part of the library's API; the binary compiles this module separately and does not call it.
+    #[allow(dead_code)]
     pub fn size_bytes(&self) -> u64 {
         self.models().iter().map(|m| m.size_bytes).sum()
     }
@@ -278,6 +282,8 @@ impl Catalogue {
 
     /// Every model, in the order of the file.
     #[must_use]
+    // Part of the library's API; the binary compiles this module separately and does not call it.
+    #[allow(dead_code)]
     pub fn models(&self) -> &[Model] {
         &self.models
     }

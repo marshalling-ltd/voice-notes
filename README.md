@@ -38,7 +38,7 @@ cargo run -- setup                  # find your models and services and save the
 cargo run -- --plain                # line-by-line interface (also used when not in a terminal)
 ```
 
-Keys: `Enter` start/stop (or skip speech), `p` next profile, `t` notes/talk, `r` read aloud, `u` setup, `d` audio devices, `c` clean (notes), `n` new conversation (talk), `↑↓` scroll, `q` quit.
+Keys: `Enter` start/stop (or skip speech), `p` next profile, `t` notes/talk, `r` read aloud, `u` setup, `d` audio devices, `m` models, `c` clean (notes), `n` new conversation (talk), `↑↓` scroll, `q` quit.
 
 Other options: `--language hr` (spoken language, default `en`, `auto` to detect), `--threshold` (minimum speech level), `--no-speech` (text only), `--verbose` (with `--plain`, show the live input level). `--backend`, `--chat-model` and `--think` adjust the launch profile.
 
@@ -176,6 +176,12 @@ Saved settings live in `~/.config/voice-notes/config.toml` (Linux) or `~/Library
 
 If the server cannot be reached, the app says so once and switches to the system voice (`--voice`, default `en`), so talking keeps working. `--tts system` skips Kokoro entirely.
 
+### Models
+
+Press `m` to open the models screen. It looks at your machine (memory for models, GPU), shows which of four size classes fits (`minimal`, `light`, `standard`, `power`), and lists the models that class starts with: speech to text, chat, text to speech and, for `power`, a reasoning model. Each row says whether the model is installed, partly downloaded, or missing, with its size. `←` `→` look at another class, `↑` `↓` choose a row, and the licence of the highlighted model is shown below the list.
+
+`Enter` downloads the highlighted model and `a` downloads everything of the class that is missing, one after the other, with a progress bar. `x` cancels; what arrived is kept, and the next `Enter` continues from there. Each finished file is checked against its sha256, and a file that does not match is deleted. The models come from `models.toml`, and they are downloaded to `~/.local/share/voice-notes-stack/models` (or `$VOICE_NOTES_STACK_HOME/models`), the folder `stack/macos.sh` serves models from; set `models_dir` in the config file to use another folder. The download does not change which model the app uses: that is still chosen with `--chat-model` or `voice-notes setup`.
+
 ### Microphone and speaker
 
 By default the app uses the system's default microphone and speaker. To use others, press `d` in the app: one row each for the microphone and the speaker, `←` `→` to change, `Enter` to save. The choice is saved in the config file and used again after a restart.
@@ -207,6 +213,7 @@ If nothing appears while you speak, run `cargo run -- --plain --verbose` and com
 | `src/config.rs` | Saved settings |
 | `src/catalogue.rs` | Reads `models.toml`: every model with its address, checksum, size and licence, and what each size class starts with |
 | `models.toml` | The model catalogue, embedded in the program |
+| `src/modelscreen.rs` | The models screen: the classes' models, what is installed, and what the keys do |
 | `src/download.rs` | Downloads a catalogue model: resumes, checks free disk space and the sha256, reports progress |
 | `src/setup.rs` | Finds models and services, picks the best, suggests models for your machine, saves the choices |
 | `src/hardware.rs` | Detects memory, GPU and disk; size classes |

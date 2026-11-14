@@ -42,6 +42,9 @@ pub struct Config {
     pub input_device: Option<String>,
     /// The speaker to play replies on: a device id or a name. Absent means the system default.
     pub output_device: Option<String>,
+    /// The folder the models screen downloads models into. Absent means the folder the native
+    /// stack (`stack/macos.sh`) serves models from, `~/.local/share/voice-notes-stack/models`.
+    pub models_dir: Option<String>,
     /// The profile used at launch (`fast` if absent).
     pub profile: Option<String>,
     /// The reasoning model behind the `smart` and `think` profiles.
@@ -81,7 +84,36 @@ pub fn path_from(xdg: Option<&str>, home: Option<&str>, macos: bool) -> Option<P
     Some(base.join("voice-notes").join("config.toml"))
 }
 
+/// The models folder: `configured` if set, else `models` inside the stack's home folder, which is
+/// `stack_home` (the `VOICE_NOTES_STACK_HOME` variable) or `~/.local/share/voice-notes-stack`.
+/// This is the same folder `stack/macos.sh` uses, so what is downloaded is what it serves.
+#[must_use]
+pub fn models_dir_from(
+    configured: Option<&str>,
+    stack_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(dir) = configured.filter(|d| !d.trim().is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let base = match stack_home.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(home?).join(".local/share/voice-notes-stack"),
+    };
+    Some(base.join("models"))
+}
+
 impl Config {
+    /// Where models are downloaded to (see [`models_dir_from`]).
+    #[must_use]
+    pub fn models_dir(&self) -> Option<PathBuf> {
+        models_dir_from(
+            self.models_dir.as_deref(),
+            std::env::var("VOICE_NOTES_STACK_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    }
+
     /// The config file path on this machine.
     #[must_use]
     pub fn path() -> Option<PathBuf> {
@@ -192,6 +224,44 @@ mod tests {
         let hand_written = Config::parse("input_device = \"Blue Yeti\"\n").unwrap();
         assert_eq!(hand_written.input_device.as_deref(), Some("Blue Yeti"));
         assert_eq!(hand_written.output_device, None);
+    }
+
+    /// Downloads go where the native stack serves models from, unless the config says otherwise.
+    #[test]
+    fn the_models_folder_defaults_to_the_stacks_and_can_be_overridden() {
+        let dir = |configured, stack, home| models_dir_from(configured, stack, home);
+        assert_eq!(
+            dir(None, None, Some("/home/me")),
+            Some(PathBuf::from(
+                "/home/me/.local/share/voice-notes-stack/models"
+            ))
+        );
+        assert_eq!(
+            dir(None, Some("/data/vn"), Some("/home/me")),
+            Some(PathBuf::from("/data/vn/models")),
+            "the same variable stack/macos.sh reads"
+        );
+        assert_eq!(
+            dir(Some("/big/disk"), Some("/data/vn"), Some("/home/me")),
+            Some(PathBuf::from("/big/disk")),
+            "the config wins"
+        );
+        assert_eq!(
+            dir(Some("  "), None, Some("/home/me")),
+            dir(None, None, Some("/home/me"))
+        );
+        assert_eq!(dir(None, None, None), None, "no home, no guess");
+    }
+
+    #[test]
+    fn the_models_folder_is_saved_in_the_config() {
+        let config = Config {
+            models_dir: Some("/big/disk/models".into()),
+            ..Config::default()
+        };
+        let text = config.render().unwrap();
+        assert!(text.contains("models_dir = \"/big/disk/models\""), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), config);
     }
 
     /// An empty file, or one with only some fields, is fine; junk is an error.
