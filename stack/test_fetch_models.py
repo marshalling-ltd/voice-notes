@@ -160,6 +160,20 @@ class FetchTests(unittest.TestCase):
                 self.assertGreater(model["size_bytes"], 1_000_000, where)
                 self.assertTrue(model["url"].startswith("https://"), where)
 
+    def test_model_urls_name_a_commit_not_a_branch(self):
+        """`resolve/main` can change under us; `resolve/<40 hex>` cannot. See MODEL_HOSTING.md."""
+        import glob
+        import re
+        import tomllib
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        files = glob.glob(os.path.join(here, "*models.toml")) + glob.glob(os.path.join(here, "profiles", "*.toml"))
+        self.assertGreaterEqual(len(files), 6)
+        for path in files:
+            with open(path, "rb") as f:
+                for model in tomllib.load(f)["model"]:
+                    self.assertRegex(model["url"], r"/resolve/[0-9a-f]{40}/", f"{path}: {model['id']}")
+
     def test_whisper_writes_its_temporary_files_outside_the_read_only_models_folder(self):
         """--convert writes files to --tmp-dir, which defaults to the working directory (/models),
         and compose mounts /models read-only. Without --tmp-dir every transcription returns 500."""
