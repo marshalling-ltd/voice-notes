@@ -3,19 +3,16 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::io::IsTerminal;
 
 mod audio;
-// Used by the downloader and the models screen (tickets #24 and #25); not by the program yet.
-#[allow(dead_code)]
 mod catalogue;
 mod chat;
 mod config;
 mod devices;
-// Used by the models screen and first-run setup (VN-19 and VN-30); not by the program yet.
-#[allow(dead_code)]
 mod download;
 mod endpoints;
 mod hardware;
 mod headless;
 mod latency;
+mod modelscreen;
 mod pipeline;
 mod plain;
 mod playback;

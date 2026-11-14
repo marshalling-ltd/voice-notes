@@ -994,6 +994,7 @@ pub fn overlay(base: Config, new: &Config) -> Config {
         chat_url: new.chat_url.clone().or(base.chat_url),
         models_url: new.models_url.clone().or(base.models_url),
         stt_model: new.stt_model.clone().or(base.stt_model),
+        models_dir: new.models_dir.clone().or(base.models_dir),
         input_device: new.input_device.clone().or(base.input_device),
         output_device: new.output_device.clone().or(base.output_device),
         profile: new.profile.clone().or(base.profile),

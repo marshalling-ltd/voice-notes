@@ -16,10 +16,14 @@
 //! ```
 
 use crate::audio::{AudioRecorder, MicError};
+use crate::catalogue::{Catalogue, Job as ModelJob};
 use crate::chat::{Conversation, ReplyDelta};
 use crate::config::Config;
 use crate::devices::{self, DeviceInfo, Direction};
+use crate::download::{self, Phase as DownloadPhase};
 use crate::endpoints::Endpoints;
+use crate::hardware::{Tier, gib};
+use crate::modelscreen::{ActiveDownload, InstallState, ModelsAction, ModelsScreen};
 use crate::pipeline::{Job, Outcome, Settings, spawn_transcriber};
 use crate::setup::{self, Choice, Findings};
 use crate::speech::{SentenceSplitter, Speaker};
@@ -29,7 +33,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, BorderType, Gauge, Paragraph, Sparkline, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -143,6 +147,12 @@ pub enum Action {
         input: Option<String>,
         output: Option<String>,
     },
+    /// Look at this machine and open the models screen.
+    OpenModels,
+    /// Download these models (catalogue ids), one after the other.
+    StartDownloads(Vec<String>),
+    /// Stop the running download and drop the ones waiting.
+    CancelDownload,
 }
 
 /// Turns a saved config into the settings the session runs with.
@@ -273,6 +283,8 @@ pub struct App {
     pub chooser: Option<Chooser>,
     /// The microphone and speaker chooser.
     pub devices: Option<DeviceChooser>,
+    /// The models screen.
+    pub models: Option<ModelsScreen>,
     /// The profile in use, and every profile `p` can switch to.
     pub profile: String,
     pub profiles: Vec<String>,
@@ -302,6 +314,7 @@ impl App {
             setup: None,
             chooser: None,
             devices: None,
+            models: None,
             profile: String::new(),
             profiles: Vec::new(),
             speak_enabled: true,
@@ -511,12 +524,16 @@ impl App {
         if self.devices.is_some() {
             return self.on_devices_key(key);
         }
+        if self.models.is_some() {
+            return self.on_models_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('u') if self.idle() => return Some(Action::OpenSetup),
             KeyCode::Char('d') if self.idle() => return Some(Action::OpenDevices),
+            KeyCode::Char('m') if self.idle() => return Some(Action::OpenModels),
             KeyCode::Char('p') if self.idle() => {
                 return self.next_profile().map(Action::SwitchProfile);
             }
@@ -648,6 +665,24 @@ impl App {
         self.chooser = Some(chooser);
     }
 
+    /// Keys while the models screen is open.
+    fn on_models_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let screen = self.models.as_mut()?;
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => self.models = None,
+            _ => {
+                return screen.on_key(key).map(|action| match action {
+                    ModelsAction::Download(ids) => Action::StartDownloads(ids),
+                    ModelsAction::Cancel => Action::CancelDownload,
+                });
+            }
+        }
+        None
+    }
+
     /// Keys while the device chooser is open.
     fn on_devices_key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -736,12 +771,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_devices(frame, devices, app.notice.as_deref());
         return;
     }
+    if let Some(models) = &app.models {
+        draw_models(frame, models, app.notice.as_deref());
+        return;
+    }
     let [header, meter, body, warnings, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(5),
         Constraint::Min(5),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
     draw_header(frame, header, app);
@@ -1213,6 +1252,252 @@ fn setup_state(found: &Findings) -> SetupState {
 }
 
 /// The model chooser screen.
+fn job_title(job: ModelJob) -> &'static str {
+    match job {
+        ModelJob::SpeechToText => "Speech to text",
+        ModelJob::Chat => "Chat",
+        ModelJob::Reasoning => "Reasoning",
+        ModelJob::TextToSpeech => "Text to speech",
+    }
+}
+
+/// A whole percentage of `done` out of `total`.
+fn percent(done: u64, total: u64) -> u16 {
+    let value = u128::from(done) * 100 / u128::from(total.max(1));
+    u16::try_from(value.min(100)).unwrap_or(100)
+}
+
+/// The class line: the four classes, the viewed one in brackets, the one that fits this machine
+/// starred.
+fn models_class_line(screen: &ModelsScreen) -> Line<'static> {
+    let mut spans = vec![Span::styled("Class         ‹ ", Style::new().fg(DIM))];
+    for tier in [Tier::Minimal, Tier::Light, Tier::Standard, Tier::Power] {
+        let star = if screen.detected == Some(tier) {
+            "*"
+        } else {
+            ""
+        };
+        let label = format!("{}{star}", tier.label());
+        spans.push(if tier == screen.viewing {
+            Span::styled(
+                format!("[{label}]"),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {label} "), Style::new().fg(Color::White))
+        });
+    }
+    spans.push(Span::styled(" ›", Style::new().fg(DIM)));
+    spans.push(Span::styled(
+        if screen.detected.is_some() {
+            "   * fits this machine"
+        } else {
+            "   memory not detected"
+        },
+        Style::new().fg(DIM),
+    ));
+    Line::from(spans)
+}
+
+/// One model of the viewed class: the job, the name, the size, and whether it is on disk.
+fn models_row_line(screen: &ModelsScreen, index: usize, width: usize) -> Line<'static> {
+    let row = &screen.rows[index];
+    let focused = index == screen.focus;
+    let downloading = screen
+        .active
+        .as_ref()
+        .is_some_and(|a| a.model_id == row.model.id);
+    let (state, colour) = if downloading {
+        ("⬇ downloading".to_string(), ACCENT)
+    } else {
+        match row.state {
+            InstallState::Installed => ("✓ installed".to_string(), GOOD),
+            InstallState::Partial { have } => (
+                format!("◐ {}% kept", percent(have, row.model.size_bytes)),
+                WARN,
+            ),
+            InstallState::Missing => ("○ not installed".to_string(), Color::White),
+        }
+    };
+    let name_style = if focused {
+        Style::new().fg(GOOD).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::White)
+    };
+    // marker 2, job 16, name, size 9, state 17: the name takes the rest.
+    let name_width = width.saturating_sub(2 + 16 + 9 + 17).max(8);
+    Line::from(vec![
+        Span::styled(if focused { "▶ " } else { "  " }, Style::new().fg(ACCENT)),
+        Span::styled(
+            format!("{:<16}", job_title(row.job)),
+            Style::new().fg(if focused { ACCENT } else { Color::White }),
+        ),
+        Span::styled(
+            format!("{:<name_width$}", fit(&row.model.name, name_width)),
+            name_style,
+        ),
+        Span::styled(
+            format!("{:>8} ", gib(row.model.size_bytes)),
+            Style::new().fg(DIM),
+        ),
+        Span::styled(state, Style::new().fg(colour)),
+    ])
+}
+
+/// Everything above the download status: the machine, the classes, the models, and the details
+/// of the highlighted one (its licence is shown before anything is downloaded).
+fn models_text(screen: &ModelsScreen, width: usize) -> Vec<Line<'static>> {
+    let detail = |label: &str, text: &str| {
+        Line::from(vec![
+            Span::styled(format!("{label:<9}"), Style::new().fg(DIM)),
+            Span::raw(fit(text, width.saturating_sub(9))),
+        ])
+    };
+    let mut lines = vec![
+        detail("This machine", &screen.hardware),
+        models_class_line(screen),
+        Line::default(),
+    ];
+    lines.extend((0..screen.rows.len()).map(|i| models_row_line(screen, i, width)));
+    lines.push(Line::default());
+    if let Some(row) = screen.rows.get(screen.focus) {
+        let link = row.model.licence_url.as_deref().unwrap_or("");
+        lines.push(detail(
+            "Licence",
+            &format!("{} · {link}", row.model.licence),
+        ));
+    }
+    lines.push(detail("Folder", &screen.dir().display().to_string()));
+    let left = screen.bytes_to_download();
+    lines.push(detail(
+        "To get",
+        &if left == 0 {
+            format!("everything for {} is installed", screen.viewing.label())
+        } else {
+            format!(
+                "{} still to download for {}",
+                gib(left),
+                screen.viewing.label()
+            )
+        },
+    ));
+    lines
+}
+
+/// The three rows at the bottom: what is downloading with its gauge, or how to start.
+fn draw_models_status(frame: &mut Frame, area: Rect, screen: &ModelsScreen) {
+    let Some(active) = &screen.active else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Enter downloads the highlighted model; a downloads everything that is missing.",
+                Style::new().fg(DIM),
+            ))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    };
+    let name = Catalogue::builtin()
+        .model(&active.model_id)
+        .map_or(active.model_id.as_str(), |m| m.name.as_str());
+    let (verb, shown) = match active.progress {
+        Some(p) if p.phase == DownloadPhase::Verifying => ("Checking", Some(p)),
+        other => ("Downloading", other),
+    };
+    let waiting = if active.waiting > 0 {
+        format!(" · {} more waiting", active.waiting)
+    } else {
+        String::new()
+    };
+    let [title, bar, detail] = Layout::vertical([Constraint::Length(1); 3]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            fit(&format!("{verb} {name}{waiting}"), usize::from(area.width)),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        title,
+    );
+    let pct = shown.map_or(0, |p| percent(p.done, p.total));
+    frame.render_widget(
+        Gauge::default()
+            .percent(pct)
+            .label(format!("{pct}%"))
+            .gauge_style(Style::new().fg(ACCENT).bg(Color::DarkGray)),
+        bar,
+    );
+    if let Some(p) = shown {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("{} of {}", gib(p.done), gib(p.total)),
+                Style::new().fg(DIM),
+            )),
+            detail,
+        );
+    }
+}
+
+/// The models screen: what this machine can run, and what of it is on disk.
+fn draw_models(frame: &mut Frame, screen: &ModelsScreen, notice: Option<&str>) {
+    let [body, warnings, footer] = Layout::vertical([
+        Constraint::Min(5),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    let block = panel("Voice Notes · Models");
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+    let [text, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(models_text(screen, usize::from(inner.width))),
+        text,
+    );
+    draw_models_status(frame, status, screen);
+    if let Some(notice) = notice {
+        let line = fit(
+            &format!("⚠ {notice}"),
+            usize::from(warnings.width).saturating_sub(2),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(line, Style::new().fg(BAD).add_modifier(Modifier::BOLD)),
+            ])),
+            warnings,
+        );
+    }
+    let stop_or_close = if screen.busy() {
+        ("x", " cancel")
+    } else {
+        ("Esc", " close")
+    };
+    let keys = [
+        ("Enter", " download"),
+        ("a", " all"),
+        ("←→", " class"),
+        ("↑↓", " row"),
+        stop_or_close,
+        ("q", " quit"),
+    ];
+    frame.render_widget(Paragraph::new(hint_line(&keys)), footer);
+}
+
+/// A line of key hints: the key in colour, what it does in grey.
+fn hint_line(keys: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, what)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::new().fg(DIM)));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled((*what).to_string(), Style::new().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
 /// The microphone and speaker chooser, in the style of the model chooser.
 fn draw_devices(frame: &mut Frame, chooser: &DeviceChooser, notice: Option<&str>) {
     let [body, warnings, footer] = Layout::vertical([
@@ -1359,47 +1644,42 @@ fn draw_chooser(frame: &mut Frame, chooser: &Chooser) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let key =
-        |k: &'static str| Span::styled(k, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
-    let text = |t: &'static str| Span::styled(t, Style::new().fg(DIM));
     let action = match app.phase {
         Phase::Calibrating | Phase::Listening => " stop",
         Phase::Speaking => " skip",
         Phase::Finishing | Phase::Cleaning | Phase::Thinking => " wait",
         Phase::Idle | Phase::Done => " start",
     };
-    // Two spaces between the hints: with the device key the line would not fit 80 columns
-    // otherwise.
-    let sep = || Span::raw("  ");
-    let mut spans = vec![Span::raw(" "), key("Enter"), text(action)];
+    // Two rows: what to do with the app first, then the keys for reading and leaving.
+    let mut first = vec![("Enter", action)];
+    let mut second = Vec::new();
     if app.idle() {
-        spans.extend([
-            sep(),
-            key("u"),
-            text(" setup"),
-            sep(),
-            key("d"),
-            text(" devices"),
-            sep(),
-            key("p"),
-            text(" profile"),
-            sep(),
-            key("t"),
-            text(if app.mode == Mode::Talk {
-                " notes"
-            } else {
-                " talk"
-            }),
+        first.extend([
+            ("u", " setup"),
+            ("d", " devices"),
+            ("m", " models"),
+            ("p", " profile"),
+            (
+                "t",
+                if app.mode == Mode::Talk {
+                    " notes"
+                } else {
+                    " talk"
+                },
+            ),
         ]);
-        spans.extend([sep(), key("r"), text(" read")]);
+        second.push(("r", " read"));
     }
-    if app.mode == Mode::Talk {
-        spans.extend([sep(), key("n"), text(" new")]);
+    second.push(if app.mode == Mode::Talk {
+        ("n", " new")
     } else {
-        spans.extend([sep(), key("c"), text(" clean")]);
-    }
-    spans.extend([sep(), key("↑↓"), sep(), key("q"), text(" quit")]);
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        ("c", " clean")
+    });
+    second.extend([("↑↓", " scroll"), ("q", " quit")]);
+    frame.render_widget(
+        Paragraph::new(vec![hint_line(&first), hint_line(&second)]),
+        area,
+    );
 }
 
 /// The warning for a failed recording. A microphone problem already says what to do about it
@@ -1425,6 +1705,17 @@ pub async fn run(settings: Settings, resolve: Resolver, config: Config) -> Resul
 }
 
 /// Everything the event loop drives besides the screen state.
+/// A model download running in the background.
+struct RunningDownload {
+    /// The catalogue id of the model.
+    id: String,
+    /// Set to stop it.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Progress reports from the download.
+    progress: UnboundedReceiver<download::Progress>,
+    task: JoinHandle<Result<download::Fetched, download::DownloadError>>,
+}
+
 struct Session {
     recorder: AudioRecorder,
     speaker: Speaker,
@@ -1451,6 +1742,12 @@ struct Session {
     /// choice made in the app wins over flags and over what a settings change resolves.
     input_device: Option<String>,
     output_device: Option<String>,
+    /// Where models are downloaded to and looked for.
+    models_dir: std::path::PathBuf,
+    /// The model download that is running, if any.
+    download: Option<RunningDownload>,
+    /// Models waiting for it to finish, by catalogue id.
+    download_queue: std::collections::VecDeque<String>,
     /// Looking around for models and services (setup screen).
     probe_task: Option<JoinHandle<Findings>>,
     /// Builds settings from a freshly saved config.
@@ -1463,6 +1760,9 @@ impl Session {
         let (jobs, outcomes) =
             spawn_transcriber(client.clone(), Self::transcribe_options(settings));
         let (deltas_tx, deltas_rx) = tokio::sync::mpsc::unbounded_channel();
+        let models_dir = config
+            .models_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("models"));
         Self {
             recorder: AudioRecorder::new(settings.min_threshold, false)
                 .with_device(settings.input_device.clone()),
@@ -1483,6 +1783,9 @@ impl Session {
             config,
             input_device: settings.input_device.clone(),
             output_device: settings.speech.output_device.clone(),
+            models_dir,
+            download: None,
+            download_queue: std::collections::VecDeque::new(),
             probe_task: None,
             resolve,
         }
@@ -1582,7 +1885,139 @@ impl Session {
             Action::SkipSetup => self.skip_setup(app),
             Action::SwitchProfile(name) => self.switch_profile(app, &name),
             Action::OpenDevices => self.open_devices(app),
+            Action::OpenModels => self.open_models(app),
+            Action::StartDownloads(ids) => self.start_downloads(app, ids),
+            Action::CancelDownload => self.cancel_download(),
             Action::SaveDevices { input, output } => self.save_devices(app, input, output),
+        }
+    }
+
+    /// Look at this machine and open the models screen.
+    fn open_models(&mut self, app: &mut App) {
+        let hardware = crate::hardware::detect();
+        let mut screen =
+            ModelsScreen::new(hardware.summary(), hardware.tier(), self.models_dir.clone());
+        if let Some(running) = &self.download {
+            screen.active = Some(ActiveDownload {
+                model_id: running.id.clone(),
+                progress: None,
+                waiting: self.download_queue.len(),
+            });
+        }
+        app.notice = None;
+        app.models = Some(screen);
+    }
+
+    /// Queue these models and start the first, unless a download is already running.
+    fn start_downloads(&mut self, app: &mut App, ids: Vec<String>) {
+        if self.download.is_some() {
+            return;
+        }
+        app.notice = None;
+        self.download_queue = ids.into();
+        self.start_next_download(app);
+    }
+
+    /// Start downloading the next queued model in the background.
+    fn start_next_download(&mut self, app: &mut App) {
+        let Some(id) = self.download_queue.pop_front() else {
+            return;
+        };
+        let Some(model) = Catalogue::builtin().model(&id).cloned() else {
+            app.notice = Some(format!("\"{id}\" is not in the model catalogue"));
+            return;
+        };
+        let (progress_tx, progress) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let options = download::Options {
+            cancel: Arc::clone(&cancel),
+            ..download::Options::default()
+        };
+        let (client, dir) = (self.client.clone(), self.models_dir.clone());
+        let task = tokio::spawn(async move {
+            let mut report = |p: download::Progress| {
+                let _ = progress_tx.send(p);
+            };
+            download::fetch(&client, &model, &dir, &options, &mut report).await
+        });
+        if let Some(screen) = app.models.as_mut() {
+            screen.active = Some(ActiveDownload {
+                model_id: id.clone(),
+                progress: None,
+                waiting: self.download_queue.len(),
+            });
+        }
+        self.download = Some(RunningDownload {
+            id,
+            cancel,
+            progress,
+            task,
+        });
+    }
+
+    /// Stop the running download (what arrived is kept) and forget the ones waiting.
+    fn cancel_download(&mut self) {
+        self.download_queue.clear();
+        if let Some(running) = &self.download {
+            running
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Pass the download's progress to the screen, and deal with it when it ends.
+    async fn poll_download(&mut self, app: &mut App) {
+        let Some(running) = self.download.as_mut() else {
+            return;
+        };
+        let mut latest = None;
+        while let Ok(progress) = running.progress.try_recv() {
+            latest = Some(progress);
+        }
+        if let (Some(progress), Some(active)) =
+            (latest, app.models.as_mut().and_then(|s| s.active.as_mut()))
+        {
+            active.progress = Some(progress);
+            active.waiting = self.download_queue.len();
+        }
+        if running.task.is_finished()
+            && let Some(done) = self.download.take()
+        {
+            let result = done.task.await;
+            self.finish_download(app, &done.id, result);
+        }
+    }
+
+    /// A download ended: show what is on disk now, and go on to the next one if all went well.
+    fn finish_download(
+        &mut self,
+        app: &mut App,
+        id: &str,
+        result: Result<Result<download::Fetched, download::DownloadError>, tokio::task::JoinError>,
+    ) {
+        if let Some(screen) = app.models.as_mut() {
+            screen.active = None;
+            screen.refresh();
+        }
+        let name = Catalogue::builtin()
+            .model(id)
+            .map_or_else(|| id.to_string(), |m| m.name.clone());
+        match result {
+            Ok(Ok(_)) => self.start_next_download(app),
+            Ok(Err(download::DownloadError::Cancelled)) => self.download_queue.clear(),
+            Ok(Err(e)) => {
+                self.download_queue.clear();
+                let hint = if e.keeps_progress() {
+                    " Enter continues."
+                } else {
+                    ""
+                };
+                app.notice = Some(format!("{name}: {e}.{hint}"));
+            }
+            Err(e) => {
+                self.download_queue.clear();
+                app.notice = Some(format!("{name}: the download stopped unexpectedly ({e})"));
+            }
         }
     }
 
@@ -1784,6 +2219,8 @@ impl Session {
 
     /// Pick up the cleaned text or the assistant's answer once their tasks finish.
     async fn finish_tasks(&mut self, app: &mut App) {
+        self.poll_download(app).await;
+
         if self
             .probe_task
             .as_ref()
@@ -1919,6 +2356,7 @@ async fn event_loop(
         session.advance(&mut app);
         session.finish_tasks(&mut app).await;
     }
+    session.cancel_download(); // what arrived is kept, and resumes next time
     Ok(app.final_text())
 }
 
@@ -2066,11 +2504,11 @@ mod tests {
             rows[warning]
         );
         assert!(rows[warning].contains('⚠'));
-        // Between the panes and the key hints, on a row that holds nothing else.
+        // Between the panes and the two rows of key hints, on a row that holds nothing else.
         assert_eq!(
             warning,
-            22,
-            "one row above the footer:\n{}",
+            21,
+            "just above the key hints:\n{}",
             rows.join("\n")
         );
         assert!(!rows[warning].contains("Enter"));
@@ -2083,7 +2521,7 @@ mod tests {
         let clean = render(&app);
         app.notice = Some(NO_MICROPHONE.to_string());
         let warned = render(&app);
-        assert_eq!(clean[23], warned[23]);
+        assert_eq!(clean[22..], warned[22..], "both rows of hints");
         assert!(warned[23].contains("quit"), "{:?}", warned[23]);
     }
 
@@ -2091,7 +2529,7 @@ mod tests {
     #[test]
     fn no_warning_leaves_the_row_empty() {
         let rows = render(&App::new(false));
-        assert_eq!(rows[22].trim(), "");
+        assert_eq!(rows[21].trim(), "");
         assert!(!rows.join("\n").contains('⚠'));
     }
 
@@ -2102,9 +2540,9 @@ mod tests {
         app.notice = Some("speech service is down; using the system voice".to_string());
         let rows = render(&app);
         assert!(
-            rows[22].contains("⚠ speech service is down; using the system voice"),
+            rows[21].contains("⚠ speech service is down; using the system voice"),
             "{:?}",
-            rows[22]
+            rows[21]
         );
     }
 
@@ -2114,10 +2552,10 @@ mod tests {
         let mut app = App::new(false);
         app.notice = Some("x".repeat(300));
         let rows = render(&app);
-        assert!(rows[22].trim_end().ends_with('…'), "{:?}", rows[22]);
-        assert!(rows[22].chars().count() <= 80);
+        assert!(rows[21].trim_end().ends_with('…'), "{:?}", rows[21]);
+        assert!(rows[21].chars().count() <= 80);
         assert!(
-            rows[21].contains('╯') || rows[21].contains('─'),
+            rows[20].contains('╯') || rows[20].contains('─'),
             "the body border is intact"
         );
     }
@@ -2151,14 +2589,14 @@ mod tests {
             app.notice = Some(recorder_notice("recording failed", &error));
             let rows = render(&app);
             assert!(
-                rows[22].contains(&format!("⚠ {error}")),
+                rows[21].contains(&format!("⚠ {error}")),
                 "{problem:?}: {:?}",
-                rows[22]
+                rows[21]
             );
             assert!(
-                !rows[22].contains('…'),
+                !rows[21].contains('…'),
                 "{problem:?} was cut: {:?}",
-                rows[22]
+                rows[21]
             );
         }
     }
@@ -3115,6 +3553,211 @@ mod session_tests {
         Arc::new(|_, _| anyhow::bail!("not used in this test"))
     }
 
+    // ---- model downloads
+
+    fn session_for_downloads() -> (Session, App) {
+        let session = Session::new(
+            &settings("http://127.0.0.1:1/stt", "w", "c"),
+            unused_resolver(),
+            Config::default(),
+        );
+        let mut app = App::new(false);
+        app.models = Some(ModelsScreen::new(
+            "test machine".into(),
+            Some(Tier::Minimal),
+            "/nonexistent".into(),
+        ));
+        (session, app)
+    }
+
+    /// Pretend a download is running: its task ends with `result` as soon as it is polled.
+    fn running(
+        id: &str,
+        result: Result<download::Fetched, download::DownloadError>,
+    ) -> (
+        RunningDownload,
+        tokio::sync::mpsc::UnboundedSender<download::Progress>,
+    ) {
+        let (tx, progress) = tokio::sync::mpsc::unbounded_channel();
+        let download = RunningDownload {
+            id: id.into(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress,
+            task: tokio::spawn(async move { result }),
+        };
+        (download, tx)
+    }
+
+    fn fetched() -> download::Fetched {
+        download::Fetched {
+            path: "/models/x".into(),
+            kind: download::FetchKind::Fresh,
+        }
+    }
+
+    async fn finished(session: &mut Session, app: &mut App) {
+        for _ in 0..50 {
+            session.poll_download(app).await;
+            if session.download.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the download did not finish");
+    }
+
+    #[tokio::test]
+    async fn progress_reaches_the_screen_while_a_download_runs() {
+        let (mut session, mut app) = session_for_downloads();
+        let (mut download, tx) = running("qwen3-4b", Ok(fetched()));
+        // A task that never finishes during this test, so only the progress is looked at.
+        download.task = tokio::spawn(std::future::pending());
+        session.download = Some(download);
+        app.models.as_mut().unwrap().active = Some(ActiveDownload {
+            model_id: "qwen3-4b".into(),
+            progress: None,
+            waiting: 0,
+        });
+        let report = |done| download::Progress {
+            phase: DownloadPhase::Downloading,
+            done,
+            total: 100,
+        };
+        tx.send(report(10)).unwrap();
+        tx.send(report(40)).unwrap();
+        session.poll_download(&mut app).await;
+        let shown = app
+            .models
+            .as_ref()
+            .unwrap()
+            .active
+            .as_ref()
+            .unwrap()
+            .progress;
+        assert_eq!(shown, Some(report(40)), "the latest report wins");
+        session.download.take().unwrap().task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_finished_download_clears_the_active_row_and_reports_nothing() {
+        let (mut session, mut app) = session_for_downloads();
+        app.models.as_mut().unwrap().active = Some(ActiveDownload {
+            model_id: "qwen3-4b".into(),
+            progress: None,
+            waiting: 0,
+        });
+        session.download = Some(running("qwen3-4b", Ok(fetched())).0);
+        finished(&mut session, &mut app).await;
+        assert!(app.models.as_ref().unwrap().active.is_none());
+        assert_eq!(app.notice, None, "a download that worked is not a warning");
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_shows_what_went_wrong_and_drops_the_queue() {
+        let (mut session, mut app) = session_for_downloads();
+        session.download_queue = vec!["qwen3-8b".to_string(), "kokoro-v1_0".to_string()].into();
+        let error = download::DownloadError::NotEnoughSpace {
+            needed: 5 << 30,
+            free: 1 << 30,
+        };
+        session.download = Some(running("qwen3-4b", Err(error)).0);
+        finished(&mut session, &mut app).await;
+        let notice = app.notice.clone().unwrap();
+        assert!(
+            notice.starts_with("Qwen3 4B (Q4_K_M): not enough free disk space"),
+            "{notice}"
+        );
+        assert!(
+            session.download_queue.is_empty(),
+            "the rest is not attempted after a failure"
+        );
+        assert!(session.download.is_none(), "nothing new was started");
+    }
+
+    /// After an interruption what arrived is kept, and the warning says that Enter continues it.
+    #[tokio::test]
+    async fn an_interrupted_download_says_that_enter_continues_it() {
+        let (mut session, mut app) = session_for_downloads();
+        let dropped = download::DownloadError::Network("connection reset".into());
+        session.download = Some(running("qwen3-4b", Err(dropped)).0);
+        finished(&mut session, &mut app).await;
+        let notice = app.notice.clone().unwrap();
+        assert!(
+            notice.contains("connection reset") && notice.ends_with("Enter continues."),
+            "{notice}"
+        );
+
+        let corrupt = download::DownloadError::WrongChecksum {
+            expected: "a".repeat(64),
+            actual: "b".repeat(64),
+        };
+        session.download = Some(running("qwen3-4b", Err(corrupt)).0);
+        finished(&mut session, &mut app).await;
+        let notice = app.notice.clone().unwrap();
+        assert!(
+            !notice.contains("Enter continues"),
+            "a deleted file cannot be continued: {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_download_is_not_a_warning_and_drops_the_queue() {
+        let (mut session, mut app) = session_for_downloads();
+        session.download_queue = vec!["qwen3-8b".to_string()].into();
+        session.download = Some(running("qwen3-4b", Err(download::DownloadError::Cancelled)).0);
+        finished(&mut session, &mut app).await;
+        assert_eq!(app.notice, None);
+        assert!(session.download_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_sets_the_flag_and_forgets_the_waiting_models() {
+        let (mut session, _app) = session_for_downloads();
+        let (mut download, _tx) = running("qwen3-4b", Ok(fetched()));
+        download.task = tokio::spawn(std::future::pending());
+        let flag = Arc::clone(&download.cancel);
+        session.download = Some(download);
+        session.download_queue = vec!["qwen3-8b".to_string()].into();
+        session.cancel_download();
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(session.download_queue.is_empty());
+        session.download.take().unwrap().task.abort();
+    }
+
+    #[tokio::test]
+    async fn starting_downloads_while_one_runs_changes_nothing() {
+        let (mut session, mut app) = session_for_downloads();
+        let (mut download, _tx) = running("qwen3-4b", Ok(fetched()));
+        download.task = tokio::spawn(std::future::pending());
+        session.download = Some(download);
+        session.start_downloads(&mut app, vec!["qwen3-8b".into()]);
+        assert!(session.download_queue.is_empty());
+        assert_eq!(session.download.as_ref().unwrap().id, "qwen3-4b");
+        session.download.take().unwrap().task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_model_id_is_reported_not_a_crash() {
+        let (mut session, mut app) = session_for_downloads();
+        session.start_downloads(&mut app, vec!["no-such-model".into()]);
+        assert!(app.notice.unwrap().contains("not in the model catalogue"));
+        assert!(session.download.is_none());
+    }
+
+    #[tokio::test]
+    async fn opening_the_screen_while_a_download_runs_shows_it() {
+        let (mut session, mut app) = session_for_downloads();
+        let (mut download, _tx) = running("qwen3-4b", Ok(fetched()));
+        download.task = tokio::spawn(std::future::pending());
+        session.download = Some(download);
+        session.download_queue = vec!["kokoro-v1_0".to_string()].into();
+        app.models = None;
+        session.open_models(&mut app);
+        let active = app.models.as_ref().unwrap().active.clone().unwrap();
+        assert_eq!((active.model_id.as_str(), active.waiting), ("qwen3-4b", 1));
+        session.download.take().unwrap().task.abort();
+    }
+
     /// A device chosen in the app is used for the next recording and reply, and a change of
     /// settings afterwards (a profile switch, setup) does not bring the old one back.
     #[tokio::test]
@@ -3491,13 +4134,447 @@ mod device_tests {
             } else {
                 App::new(false)
             };
-            let footer = render(&app)[23].clone();
-            assert!(footer.contains("d devices"), "{footer:?}");
+            let rows = render(&app);
+            let footer = format!("{}\n{}", rows[22], rows[23]);
+            for hint in [
+                "Enter start",
+                "u setup",
+                "d devices",
+                "m models",
+                "p profile",
+                "r read",
+                "q quit",
+            ] {
+                assert!(footer.contains(hint), "{hint} missing in:\n{footer}");
+            }
             assert!(
-                footer.contains("q quit"),
-                "the last hint was cut off: {footer:?}"
+                rows[22..].iter().all(|r| r.chars().count() <= 80),
+                "{footer}"
             );
-            assert!(footer.contains("Enter start"), "{footer:?}");
         }
+    }
+}
+
+/// The models screen.
+#[cfg(test)]
+mod models_tests {
+    use super::*;
+    use crate::download::Progress;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A models folder for one test, removed afterwards.
+    struct Folder(std::path::PathBuf);
+
+    impl Folder {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "voice-notes-ui-models-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn put(&self, name: &str, bytes: u64) {
+            std::fs::File::create(self.0.join(name))
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn app_with(screen: ModelsScreen) -> App {
+        let mut app = App::new(false);
+        app.models = Some(screen);
+        app
+    }
+
+    fn screen_in(folder: &Folder, detected: Option<Tier>) -> ModelsScreen {
+        ModelsScreen::new(
+            "linux x86_64 · 24 cores · 125 GB RAM · AMD Radeon 890M (80 GB usable)".into(),
+            detected,
+            folder.0.clone(),
+        )
+    }
+
+    fn render_sized(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn render(app: &App) -> Vec<String> {
+        render_sized(app, 80, 24)
+    }
+
+    fn text(app: &App) -> String {
+        render(app).join("\n")
+    }
+
+    fn downloading(
+        id: &str,
+        done: u64,
+        total: u64,
+        phase: DownloadPhase,
+        waiting: usize,
+    ) -> ActiveDownload {
+        ActiveDownload {
+            model_id: id.into(),
+            progress: Some(Progress { phase, done, total }),
+            waiting,
+        }
+    }
+
+    // ---- opening and leaving
+
+    #[test]
+    fn m_opens_the_models_screen_only_when_idle() {
+        let mut app = App::new(false);
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('m'))),
+            Some(Action::OpenModels)
+        );
+        app.begin(); // recording
+        assert_eq!(app.on_key(press(KeyCode::Char('m'))), None);
+    }
+
+    #[test]
+    fn escape_closes_the_screen_and_q_quits() {
+        let folder = Folder::new("leave");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        assert_eq!(app.on_key(press(KeyCode::Esc)), None);
+        assert!(app.models.is_none() && !app.quit);
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        app.on_key(press(KeyCode::Char('q')));
+        assert!(app.quit);
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn keys_for_the_main_screen_do_nothing_behind_the_models_screen() {
+        let folder = Folder::new("behind");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        for code in ['t', 'd', 'u', 'p', 'r', 'c', 'n', 'm'] {
+            assert_eq!(app.on_key(press(KeyCode::Char(code))), None, "{code}");
+        }
+        assert_eq!(app.mode, Mode::Notes);
+        assert!(app.models.is_some());
+    }
+
+    #[test]
+    fn the_screens_requests_become_program_actions() {
+        let folder = Folder::new("actions");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Minimal)));
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('a'))),
+            Some(Action::StartDownloads(vec![
+                "whisper-small".into(),
+                "qwen3-4b".into(),
+                "kokoro-v1_0".into()
+            ]))
+        );
+        assert_eq!(app.on_key(press(KeyCode::Down)), None);
+        assert_eq!(
+            app.on_key(press(KeyCode::Enter)),
+            Some(Action::StartDownloads(vec!["qwen3-4b".into()]))
+        );
+        app.models.as_mut().unwrap().active =
+            Some(downloading("qwen3-4b", 1, 2, DownloadPhase::Downloading, 0));
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('x'))),
+            Some(Action::CancelDownload)
+        );
+    }
+
+    // ---- drawing, at 80 by 24
+
+    #[test]
+    fn it_shows_the_machine_the_classes_and_the_recommended_models() {
+        let folder = Folder::new("draw");
+        let text = text(&app_with(screen_in(&folder, Some(Tier::Light))));
+        for expected in [
+            "Models",
+            "This machine",
+            "AMD Radeon 890M",
+            "[light*]",
+            "* fits this machine",
+            "Speech to text",
+            "Whisper large-v3-turbo (q5_0)",
+            "Chat",
+            "Qwen3 8B (Q4_K_M)",
+            "Text to speech",
+            "Kokoro v1.0 voice model",
+            "Folder",
+            "still to download for light",
+        ] {
+            assert!(text.contains(expected), "{expected:?} missing in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn it_shows_which_models_are_installed_partly_kept_or_missing() {
+        let folder = Folder::new("states");
+        let c = Catalogue::builtin();
+        let turbo = c.model("whisper-large-v3-turbo-q5_0").unwrap();
+        folder.put(turbo.file_name(), turbo.size_bytes);
+        let eight = c.model("qwen3-8b").unwrap();
+        folder.put(&format!("{}.part", eight.file_name()), eight.size_bytes / 4);
+        let rows = render(&app_with(screen_in(&folder, Some(Tier::Light))));
+        let line = |needle: &str| rows.iter().find(|r| r.contains(needle)).unwrap().clone();
+        assert!(
+            line("Whisper large-v3-turbo").contains("✓ installed"),
+            "{rows:?}"
+        );
+        assert!(line("Qwen3 8B").contains("◐ 25% kept"), "{rows:?}");
+        assert!(line("Kokoro").contains("○ not installed"), "{rows:?}");
+    }
+
+    #[test]
+    fn when_everything_is_there_it_says_so() {
+        let folder = Folder::new("complete");
+        for row in &screen_in(&folder, Some(Tier::Minimal)).rows {
+            folder.put(row.model.file_name(), row.model.size_bytes);
+        }
+        let text = text(&app_with(screen_in(&folder, Some(Tier::Minimal))));
+        assert!(
+            text.contains("everything for minimal is installed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_highlighted_models_licence_is_shown_before_anything_is_downloaded() {
+        let folder = Folder::new("licence");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        let first = text(&app);
+        assert!(
+            first.contains("Licence  MIT · https://github.com/openai/whisper/blob/main/LICENSE"),
+            "{first}"
+        );
+        app.on_key(press(KeyCode::Down));
+        let second = text(&app);
+        assert!(
+            second.contains(
+                "Licence  Apache-2.0 · https://huggingface.co/Qwen/Qwen3-8B/blob/main/LICENSE"
+            ),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn the_highlight_and_the_class_move_with_the_keys() {
+        let folder = Folder::new("move");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        let focused = |app: &App| render(app).into_iter().find(|r| r.contains('▶')).unwrap();
+        assert!(focused(&app).contains("Speech to text"));
+        app.on_key(press(KeyCode::Down));
+        assert!(focused(&app).contains("Chat"));
+        app.on_key(press(KeyCode::Right));
+        let text = text(&app);
+        assert!(
+            text.contains("[standard]") && text.contains("Qwen3 14B"),
+            "{text}"
+        );
+        assert!(
+            text.contains("light*"),
+            "the class that fits stays marked: {text}"
+        );
+    }
+
+    #[test]
+    fn the_power_class_lists_the_reasoning_model_too() {
+        let folder = Folder::new("power");
+        let text = text(&app_with(screen_in(&folder, Some(Tier::Power))));
+        assert!(
+            text.contains("Reasoning") && text.contains("Qwen3-Coder 30B-A3B"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_machine_whose_memory_is_unknown_is_said_so() {
+        let folder = Folder::new("unknown");
+        let text = text(&app_with(screen_in(&folder, None)));
+        assert!(
+            text.contains("memory not detected") && text.contains("[minimal]"),
+            "{text}"
+        );
+    }
+
+    // ---- the download in progress
+
+    #[test]
+    fn a_running_download_shows_a_gauge_and_how_far_it_is() {
+        let folder = Folder::new("gauge");
+        let mut screen = screen_in(&folder, Some(Tier::Light));
+        let size = Catalogue::builtin().model("qwen3-8b").unwrap().size_bytes;
+        screen.active = Some(downloading(
+            "qwen3-8b",
+            size / 2,
+            size,
+            DownloadPhase::Downloading,
+            1,
+        ));
+        let rows = render(&app_with(screen));
+        let text = rows.join("\n");
+        assert!(
+            text.contains("Downloading Qwen3 8B (Q4_K_M) · 1 more waiting"),
+            "{text}"
+        );
+        assert!(text.contains("50%"), "{text}");
+        assert!(text.contains("2.3 GB of 4.7 GB"), "{text}");
+        assert!(
+            text.contains("⬇ downloading"),
+            "the row being downloaded says so: {text}"
+        );
+        let gauge = rows.iter().find(|r| r.contains("50%")).unwrap();
+        assert!(gauge.contains('█'), "the bar is drawn: {gauge:?}");
+        assert!(
+            rows[23].contains("x cancel") && !rows[23].contains("Esc close"),
+            "{:?}",
+            rows[23]
+        );
+    }
+
+    #[test]
+    fn checking_a_finished_file_is_shown_as_checking() {
+        let folder = Folder::new("checking");
+        let mut screen = screen_in(&folder, Some(Tier::Light));
+        screen.active = Some(downloading(
+            "qwen3-8b",
+            100,
+            100,
+            DownloadPhase::Verifying,
+            0,
+        ));
+        let text = text(&app_with(screen));
+        assert!(
+            text.contains("Checking Qwen3 8B (Q4_K_M)") && text.contains("100%"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_download_that_has_not_reported_yet_shows_zero() {
+        let folder = Folder::new("zero");
+        let mut screen = screen_in(&folder, Some(Tier::Light));
+        screen.active = Some(ActiveDownload {
+            model_id: "qwen3-8b".into(),
+            progress: None,
+            waiting: 0,
+        });
+        let text = text(&app_with(screen));
+        assert!(
+            text.contains("Downloading Qwen3 8B") && text.contains("0%"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_idle_screen_explains_the_download_keys_and_offers_close() {
+        let folder = Folder::new("idle");
+        let rows = render(&app_with(screen_in(&folder, Some(Tier::Light))));
+        let text = rows.join("\n");
+        assert!(
+            text.contains("Enter downloads the highlighted model"),
+            "{text}"
+        );
+        for hint in [
+            "Enter download",
+            "a all",
+            "←→ class",
+            "↑↓ row",
+            "Esc close",
+            "q quit",
+        ] {
+            assert!(rows[23].contains(hint), "{hint} missing in {:?}", rows[23]);
+        }
+        assert!(!rows[23].contains("x cancel"));
+    }
+
+    #[test]
+    fn a_failure_appears_on_the_warnings_line_of_the_models_screen() {
+        let folder = Folder::new("warning");
+        let mut app = app_with(screen_in(&folder, Some(Tier::Light)));
+        app.notice = Some(
+            "Qwen3 8B (Q4_K_M): not enough free disk space: 4.7 GB needed, 1.0 GB free".into(),
+        );
+        let rows = render(&app);
+        assert!(
+            rows[22].contains("⚠ Qwen3 8B (Q4_K_M): not enough free disk space"),
+            "{:?}",
+            rows[22]
+        );
+    }
+
+    // ---- size
+
+    #[test]
+    fn nothing_is_drawn_outside_80_columns_in_any_state() {
+        let folder = Folder::new("width");
+        let mut screen = screen_in(&folder, Some(Tier::Power));
+        screen.active = Some(downloading(
+            "qwen3-coder-30b-a3b",
+            5 << 30,
+            17 << 30,
+            DownloadPhase::Downloading,
+            3,
+        ));
+        let mut app = app_with(screen);
+        app.notice = Some("x".repeat(200));
+        for row in render(&app) {
+            assert!(row.chars().count() <= 80, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_small_terminal_does_not_panic() {
+        let folder = Folder::new("small");
+        let mut screen = screen_in(&folder, Some(Tier::Power));
+        screen.active = Some(downloading(
+            "qwen3-14b",
+            1,
+            3,
+            DownloadPhase::Downloading,
+            0,
+        ));
+        let app = app_with(screen);
+        for (w, h) in [(40, 10), (20, 5), (80, 8), (120, 40), (1, 1)] {
+            let _ = render_sized(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn percent_is_exact_and_never_above_100() {
+        assert_eq!(percent(0, 10), 0);
+        assert_eq!(percent(5, 10), 50);
+        assert_eq!(percent(10, 10), 100);
+        assert_eq!(percent(20, 10), 100);
+        assert_eq!(percent(1, 0), 100, "an empty total counts as done");
+        assert_eq!(
+            percent(u64::MAX, u64::MAX),
+            100,
+            "no overflow for huge files"
+        );
     }
 }
