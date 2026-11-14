@@ -1,0 +1,130 @@
+# The models voice-notes knows about, and which ones each size class starts with.
+#
+# Embedded in the program (src/catalogue.rs parses it), and checked by `cargo test`: every entry
+# must be complete, every set must name existing models, and no set may contain a model that is
+# too big for its class.
+#
+# Each [[model]]:
+#   id          short unique name; sets refer to it
+#   name        what people see
+#   role        speech-to-text | chat | text-to-speech
+#   class       the smallest size class that should run it: minimal | light | standard | power
+#   url         https download address, at a fixed commit rather than a branch (stack/MODEL_HOSTING.md)
+#   sha256      of the file, 64 lowercase hex digits; the download is checked against it
+#   size_bytes  exact size of the file
+#   licence     licence name, shown before anything is downloaded
+#   licence_url where to read it
+#
+# Sizes and sha256 values are those published by the model host (checked 2026-11-14). Licences are
+# as stated on each model card; they were not independently audited.
+#
+# The default sets follow the project's hardware table: Whisper small with a 4B chat model for
+# `minimal`; Whisper large-v3-turbo with 8B for `light` and 14B for `standard`; and for `power`
+# Qwen3-Coder-30B-A3B as the fast model plus a reasoning model. Kokoro speaks in every class; its
+# weights ship inside its container image, so the stack does not download this file (macOS does).
+# The stack's own sets (stack/profiles) are chosen for CPU speed and differ on purpose; see
+# stack/README.md.
+
+[meta]
+checked = "2026-11-14"
+
+[[model]]
+id = "whisper-small"
+name = "Whisper small"
+role = "speech-to-text"
+class = "minimal"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.bin"
+sha256 = "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+size_bytes = 487601967
+licence = "MIT"
+licence_url = "https://github.com/openai/whisper/blob/main/LICENSE"
+
+[[model]]
+id = "whisper-large-v3-turbo-q5_0"
+name = "Whisper large-v3-turbo (q5_0)"
+role = "speech-to-text"
+class = "light"
+url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin"
+sha256 = "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+size_bytes = 574041195
+licence = "MIT"
+licence_url = "https://github.com/openai/whisper/blob/main/LICENSE"
+
+[[model]]
+id = "qwen3-4b"
+name = "Qwen3 4B (Q4_K_M)"
+role = "chat"
+class = "minimal"
+url = "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/22c9fc8a8c7700b76a1789366280a6a5a1ad1120/Qwen3-4B-Q4_K_M.gguf"
+sha256 = "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a"
+size_bytes = 2497281312
+licence = "Apache-2.0"
+licence_url = "https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE"
+
+[[model]]
+id = "qwen3-8b"
+name = "Qwen3 8B (Q4_K_M)"
+role = "chat"
+class = "light"
+url = "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/a6adef130ffb23ddaf1a62fec9dced968c9bc482/Qwen3-8B-Q4_K_M.gguf"
+sha256 = "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4"
+size_bytes = 5027784512
+licence = "Apache-2.0"
+licence_url = "https://huggingface.co/Qwen/Qwen3-8B/blob/main/LICENSE"
+
+[[model]]
+id = "qwen3-14b"
+name = "Qwen3 14B (Q4_K_M)"
+role = "chat"
+class = "standard"
+url = "https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/a04a82c4739b3ef5fa6da7d10261db2c67dd1985/Qwen3-14B-Q4_K_M.gguf"
+sha256 = "5eaa0870bd81ed3b58a630a271234cfa604e43ffb3a19cd68e54a80dd9d52a66"
+size_bytes = 9001753984
+licence = "Apache-2.0"
+licence_url = "https://huggingface.co/Qwen/Qwen3-14B/blob/main/LICENSE"
+
+[[model]]
+id = "qwen3-coder-30b-a3b"
+name = "Qwen3-Coder 30B-A3B (UD-Q4_K_XL)"
+role = "chat"
+class = "power"
+url = "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf"
+sha256 = "2841aa314d916434860cfb8990347528dcdfe5c350dbcb9d1461dbee88ff2533"
+size_bytes = 17665334432
+licence = "Apache-2.0"
+licence_url = "https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/LICENSE"
+
+[[model]]
+id = "kokoro-v1_0"
+name = "Kokoro v1.0 voice model"
+role = "text-to-speech"
+class = "minimal"
+url = "https://huggingface.co/hexgrad/Kokoro-82M/resolve/f3ff3571791e39611d31c381e3a41a3af07b4987/kokoro-v1_0.pth"
+sha256 = "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4"
+size_bytes = 327212226
+licence = "Apache-2.0"
+licence_url = "https://huggingface.co/hexgrad/Kokoro-82M"
+
+# What each size class starts with, by job. A reasoning model is a chat model used for the
+# `smart` and `think` profiles; only `power` has room for one next to the fast model.
+
+[sets.minimal]
+speech-to-text = "whisper-small"
+chat = "qwen3-4b"
+text-to-speech = "kokoro-v1_0"
+
+[sets.light]
+speech-to-text = "whisper-large-v3-turbo-q5_0"
+chat = "qwen3-8b"
+text-to-speech = "kokoro-v1_0"
+
+[sets.standard]
+speech-to-text = "whisper-large-v3-turbo-q5_0"
+chat = "qwen3-14b"
+text-to-speech = "kokoro-v1_0"
+
+[sets.power]
+speech-to-text = "whisper-large-v3-turbo-q5_0"
+chat = "qwen3-coder-30b-a3b"
+reasoning = "qwen3-14b"
+text-to-speech = "kokoro-v1_0"

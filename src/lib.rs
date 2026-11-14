@@ -4,6 +4,7 @@
 //! conversation loop: your speech is transcribed, answered by a chat backend, and spoken back.
 
 pub mod audio;
+pub mod catalogue;
 pub mod chat;
 pub mod config;
 pub mod devices;

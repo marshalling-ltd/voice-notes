@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::io::IsTerminal;
 
 mod audio;
+// Used by the downloader and the models screen (tickets #24 and #25); not by the program yet.
+#[allow(dead_code)]
+mod catalogue;
 mod chat;
 mod config;
 mod devices;
