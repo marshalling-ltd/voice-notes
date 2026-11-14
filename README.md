@@ -207,6 +207,7 @@ If nothing appears while you speak, run `cargo run -- --plain --verbose` and com
 | `src/config.rs` | Saved settings |
 | `src/catalogue.rs` | Reads `models.toml`: every model with its address, checksum, size and licence, and what each size class starts with |
 | `models.toml` | The model catalogue, embedded in the program |
+| `src/download.rs` | Downloads a catalogue model: resumes, checks free disk space and the sha256, reports progress |
 | `src/setup.rs` | Finds models and services, picks the best, suggests models for your machine, saves the choices |
 | `src/hardware.rs` | Detects memory, GPU and disk; size classes |
 | `src/latency.rs` | Times Whisper, the chat models and Kokoro |

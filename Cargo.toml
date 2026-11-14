@@ -17,6 +17,7 @@ ratatui = "0.30.2"
 crossterm = "0.29"
 serde_json = "1.0.154"
 toml = "1.2.1"
+sha2 = "0.10"
 
 # PipeWire/PulseAudio microphone access is Linux-only; macOS uses CoreAudio.
 [target.'cfg(target_os = "linux")'.dependencies]
