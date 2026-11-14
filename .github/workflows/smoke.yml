@@ -1,0 +1,61 @@
+name: Smoke test
+
+# One full voice turn against the real service stack, with the small CI models: a recording is
+# transcribed, answered by the chat model in a streamed reply, and spoken by the speech service.
+# If any of that breaks, this fails, so a pull request cannot silently break the voice loop.
+#
+# The same script runs by hand: `cargo build && stack/smoke.sh`.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libasound2-dev pkg-config build-essential
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the client
+        run: cargo build --locked
+
+      - name: Smoke test (tiny models)
+        run: stack/smoke.sh
+        env:
+          VOICE_NOTES: ${{ github.workspace }}/target/debug/voice-notes
+
+      # Only on failure: the result of the turn and the logs of every service.
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: smoke-out/
+          retention-days: 14

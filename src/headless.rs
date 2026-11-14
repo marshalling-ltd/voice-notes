@@ -5,7 +5,7 @@
 //! can fail has its own exit code, so a failing run says which part broke.
 
 use crate::audio::normalize_wav;
-use crate::chat::Conversation;
+use crate::chat::{Conversation, ReplyDelta};
 use crate::pipeline::Settings;
 use crate::speech::{Speaker, fetch_audio, speakable};
 use crate::transcribe::{TranscribeOptions, is_hallucination, transcribe_audio};
@@ -106,6 +106,8 @@ pub struct Timings {
 pub struct TurnReport {
     pub transcript: String,
     pub reply: String,
+    /// How many pieces the reply arrived in. More than one means it was streamed.
+    pub reply_chunks: usize,
     pub speech: Speech,
     pub timings: Timings,
     pub profile: String,
@@ -132,6 +134,7 @@ impl TurnReport {
         json!({
             "transcript": self.transcript,
             "reply": self.reply,
+            "reply_chunks": self.reply_chunks,
             "speech": speech,
             "audio_bytes": bytes,
             "speech_skipped_because": reason,
@@ -209,11 +212,18 @@ pub async fn run_turn(
     let mut conversation = Conversation::new(settings.backend.clone())
         .with_url(settings.endpoints.chat.clone())
         .with_prompt(settings.system_prompt.clone());
+    let (pieces_tx, mut pieces_rx) = tokio::sync::mpsc::unbounded_channel();
     let reply = conversation
-        .reply(client, &transcript, None)
+        .reply(client, &transcript, Some(&pieces_tx))
         .await
         .map_err(fail(Stage::Chat))?;
     timings.chat = start.elapsed();
+    let mut reply_chunks = 0;
+    while let Ok(piece) = pieces_rx.try_recv() {
+        if matches!(piece, ReplyDelta::Text(_)) {
+            reply_chunks += 1;
+        }
+    }
 
     let start = Instant::now();
     let speech = speak(client, settings, &reply, opts.no_audio_output).await?;
@@ -222,6 +232,7 @@ pub async fn run_turn(
     Ok(TurnReport {
         transcript,
         reply,
+        reply_chunks,
         speech,
         timings,
         profile: settings.profile.clone(),
@@ -366,6 +377,10 @@ mod tests {
         assert_eq!(report.transcript, "what is two plus two");
         assert_eq!(report.reply, "Four it is.");
         assert_eq!(
+            report.reply_chunks, 2,
+            "the mock server sends the reply in two pieces"
+        );
+        assert_eq!(
             report.speech,
             Speech::Discarded {
                 bytes: "RIFFfake-audio-bytes".len()
@@ -452,6 +467,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
         assert_eq!(value["transcript"], "hello there");
         assert_eq!(value["reply"], "Four it is.");
+        assert_eq!(value["reply_chunks"], 2);
         assert_eq!(value["speech"], "discarded");
         assert_eq!(value["audio_bytes"], 20);
         assert_eq!(value["profile"], "fast");

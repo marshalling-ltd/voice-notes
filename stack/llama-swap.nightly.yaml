@@ -1,0 +1,32 @@
+# llama-swap configuration for the nightly model set (see nightly-models.toml).
+# Same layout as llama-swap.yaml; file names must match what fetch_models.py downloads.
+
+healthCheckTimeout: 300
+
+models:
+  whisper:
+    ttl: 600
+    cmd: >
+      whisper-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /models/ggml-small.bin
+      --inference-path /v1/audio/transcriptions
+      --convert --tmp-dir /tmp
+
+  # Use it with: voice-notes --chat-model qwen3-4b
+  qwen3-4b:
+    ttl: 600
+    cmd: >
+      llama-server
+      --host 127.0.0.1 --port ${PORT}
+      -m /models/Qwen3-4B-Q4_K_M.gguf
+      --jinja -c 4096
+
+# Keep both loaded, so a turn does not pay for swapping (see llama-swap.yaml).
+groups:
+  voice:
+    swap: false
+    exclusive: false
+    members:
+      - "whisper"
+      - "qwen3-4b"

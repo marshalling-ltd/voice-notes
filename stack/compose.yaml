@@ -38,7 +38,7 @@ services:
       LLAMA_SWAP_CONFIG: /etc/llama-swap/config.yaml
     volumes:
       - models:/models:ro
-      - ./llama-swap.yaml:/etc/llama-swap/config.yaml:ro
+      - ${LLAMA_SWAP_CONFIG_FILE:-./llama-swap.yaml}:/etc/llama-swap/config.yaml:ro
     ports:
       - "${STACK_BIND:-127.0.0.1}:${LLAMA_SWAP_PORT:-8080}:8080"
     healthcheck:

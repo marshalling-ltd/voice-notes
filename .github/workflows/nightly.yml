@@ -1,0 +1,58 @@
+name: Nightly smoke test
+
+# The same smoke test as smoke.yml, but with bigger models (the `minimal` size class: Whisper small
+# and Qwen3-4B, about 3 GB). Too slow to gate every pull request, so it runs once a night and
+# catches breakage in the upstream images and models early.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nightly:
+    name: nightly (minimal-size models)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libasound2-dev pkg-config build-essential
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the client
+        run: cargo build --locked
+
+      - name: Smoke test (bigger models)
+        run: stack/smoke.sh
+        env:
+          VOICE_NOTES: ${{ github.workspace }}/target/debug/voice-notes
+          # Paths are relative to the stack/ folder.
+          MODELS_FILE: ./nightly-models.toml
+          LLAMA_SWAP_CONFIG_FILE: ./llama-swap.nightly.yaml
+          CHAT_MODEL: qwen3-4b
+          WAIT_TIMEOUT: "1800"
+          OUT_DIR: ${{ github.workspace }}/smoke-out-nightly
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-logs
+          path: smoke-out-nightly/
+          retention-days: 14
